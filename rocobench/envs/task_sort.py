@@ -61,6 +61,9 @@ SORTING_ACTION_SPACE="""
 1) PICK <object name> PLACE <location>
 2) WAIT
 Only PICK an object if your gripper is empty. Target <location> for PLACE should be panel or a bin.
+[Execution Semantics]
+- A failed plan does NOT change the environment state. Never assume any action in a failed plan has already happened; use only the current round scene description as the source of truth.
+- All robot actions in the same EXECUTE plan are checked against the current round state in parallel. Do NOT make one robot PICK an object that another robot is supposed to move earlier in the same EXECUTE plan.
 [Action Output Instruction]
 You must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
 Example: 'EXECUTE\nNAME Alice ACTION PICK red_square PLACE panel3\nNAME Bob ACTION WAIT\nNAME Chad ACTION PICK green_trapezoid PLACE panel6\n'
@@ -187,6 +190,9 @@ At current round:
 Your goal is to place {cube_name} on {bin_name}, but you can only reach {reachable_panels}: this means you can only pick cubes from these panels, and can only place cubes on these panels.
 {agent_state}
 Never forget you are {agent_name}! Never forget you can only reach {reachable_panels}!
+Important execution rules:
+- If a previous plan failed, it did not change the environment. Do not treat any failed action as executed; trust only the current round cube locations above.
+- In one EXECUTE plan, all PICK reachability is judged from the current round locations before any robot moves. Do not rely on another robot moving an object first in the same EXECUTE.
 Think step-by-step about the task and others' response. Carefully check and correct them if they made a mistake. 
 Improve your plans if given [Environment Feedback].
 """
@@ -554,5 +560,4 @@ if __name__ == "__main__":
     print(env.get_agent_prompt(obs, "Alice"))
     breakpoint()
     img=env.physics.render(camera_id="teaser", height=480, width=600)
-
 
