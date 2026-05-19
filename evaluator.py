@@ -17,7 +17,17 @@ DEFAULT_RUN_TIMEOUTS = {
     "pack": 600,
 }
 
-def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, run_timeout: float = None):
+# Default communication mode settings for each task, can be customized per task
+DEFAULT_COMM_MODES = {
+    "sort": "dialog",
+    "cabinet": "plan",
+    "rope": "plan",
+    "sweep": "dialog",
+    "sandwich": "plan",
+    "pack": "plan",
+}
+
+def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, run_timeout: float = None, comm_mode: str = None):
     """
     Test and run dialog tasks
     
@@ -27,13 +37,17 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
         output_dir: Output directory
         seed: Random seed
         run_timeout: Timeout for single run (seconds). If None, use value from DEFAULT_RUN_TIMEOUTS, default 60s
+        comm_mode: Communication mode. If None, use value from DEFAULT_COMM_MODES, default "chat"
     """
     # If timeout not specified, use task default or global default of 60s
     if run_timeout is None:
         run_timeout = DEFAULT_RUN_TIMEOUTS.get(task, 60)
+    # If comm mode not specified, use task default or global default of "chat"
+    if comm_mode is None:
+        comm_mode = DEFAULT_COMM_MODES.get(task, "chat")
     
     print("\n" + Colors.CYAN + Colors.BOLD + f"▶ Starting Task: {task.upper()}" + Colors.ENDC)
-    print(Colors.CYAN + f"  Configuration: {num_runs} runs, {run_timeout}s timeout per run" + Colors.ENDC)
+    print(Colors.CYAN + f"  Configuration: {num_runs} runs, {run_timeout}s timeout per run, comm_mode={comm_mode}" + Colors.ENDC)
     
     task_log_dir = next_task_log_dir(task)
     if task_log_dir is not None:
@@ -69,6 +83,7 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
                '--skip_display',
                '--tsteps', str(10),
                '--seed', str(seed),
+               '--comm_mode', comm_mode,
                '--run_timeout', str(run_timeout)]  # Pass run timeout parameter
 
     subprocess_started_at = datetime.now()
@@ -188,6 +203,7 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
         'avg_steps': total_steps / success_cnt if success_cnt > 0 else 0,
         'total_time': total_time,
         'returncode': result.returncode,
+        'comm_mode': comm_mode,
         'run_ids': current_run_ids,
     }
     if task_log_dir is not None:
