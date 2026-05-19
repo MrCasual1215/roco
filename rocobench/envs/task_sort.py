@@ -494,12 +494,13 @@ In the plan, at least one robot should be acting, you can't all WAIT.
                     feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
             if 'PICK' in action_str and 'PLACE' in action_str:
                 obj = action_str.split('PICK')[1].split('PLACE')[0].strip()
-                target = action_str.split('PLACE')[1].strip()
-                if obj in self.cube_names and target in self.cube_to_bin.values():
+                target = action_str.split('PLACE')[1].strip().split()[0]
+                if obj in self.cube_names and target.startswith('panel'):
                     correct_panel = self.cube_to_bin[obj]
-                    if correct_panel not in target:
+                    valid_panel_list = [correct_panel, 'panel3', 'panel5']
+                    if target not in valid_panel_list:
                         valid_panels = ", ".join(
-                            [correct_panel, 'panel3', 'panel5']
+                            valid_panel_list
                         )
                         feedback += f"{agent_name}'s ACTION is not valid, {obj} cube can only be placed on {valid_panels}, but not on {target}"
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
@@ -560,4 +561,3 @@ if __name__ == "__main__":
     print(env.get_agent_prompt(obs, "Alice"))
     breakpoint()
     img=env.physics.render(camera_id="teaser", height=480, width=600)
-

@@ -148,6 +148,133 @@ class DialogPrompter:
             ret += f"== Round#{i} ==\n{history}\n"
         ret += f"== Current Round ==\n"
         return ret
+
+    def compose_output_verifier_system_prompt(
+        self,
+        obs: EnvState,
+        candidate_response: str,
+        feedback_history: List[str] = [],
+    ) -> str:
+        """Compose a second-stage verifier prompt for dialog-mode output.
+
+        Dialog mode often lets the last speaker summarize other agents' proposals.
+        This verifier is a lightweight final guard: it must return only an
+        executable plan, correcting format mistakes and obvious task/reachability
+        mistakes before the normal parser + environment feedback run.
+        """
+        task_desp = self.env.describe_task_context()
+        action_desp = self.env.get_action_prompt()
+        if self.use_waypoints:
+            action_desp += PATH_PLAN_INSTRUCTION
+
+        obs_desp = self.env.describe_obs(obs)
+        round_history = self.get_round_history() if self.use_history else ""
+        execute_feedback = ""
+        if len(self.failed_plans) > 0:
+            execute_feedback = "Plans below failed to execute; do not repeat the same failure:\n"
+            execute_feedback += "\n".join(self.failed_plans) + "\n"
+
+        feedback_prompt = ""
+        useful_feedback = [f for f in feedback_history if f and f != "None"]
+        if len(useful_feedback) > 0:
+            feedback_prompt = "Previous Plans Require Improvement:\n"
+            feedback_prompt += "\n".join(useful_feedback) + "\n"
+
+        extra_sort_rules = ""
+        if self.env.__class__.__name__ == "SortOneBlockTask":
+            extra_sort_rules = """
+[Extra SortOneBlock Verification Rules]
+- Current cube locations in [Scene description] are the only source of truth.
+- Robot panel reachability is fixed: Alice can only use panel1/panel2/panel3; Bob panel3/panel4/panel5; Chad panel5/panel6/panel7.
+- All robot actions in one EXECUTE plan are simultaneous. A robot may PICK an object only if that object is already on a panel the robot can reach at the start of this round.
+- Valid PLACE panels are only each cube's target panel or handoff panels panel3/panel5:
+  blue_square -> panel2, panel3, or panel5
+  pink_polygon -> panel4, panel3, or panel5
+  yellow_trapezoid -> panel6, panel3, or panel5
+- Never PLACE any cube on panel1 or panel7.
+"""
+
+        return f"""
+{task_desp}
+{action_desp}
+{round_history}
+{execute_feedback}
+{obs_desp}
+{feedback_prompt}
+[Candidate Dialog Output To Verify]
+{candidate_response}
+
+[Verifier Rules]
+You are a strict output verifier/corrector.
+Silently check the candidate against the current scene, action format, task constraints, robot reachability, and previous feedback.
+If the candidate is valid, output it unchanged.
+If it is invalid, output a corrected plan. Prefer changing only invalid robot actions to WAIT while preserving valid actions that make progress. If all actions would be WAIT, choose one valid progress action from the current scene.
+Return ONLY the executable plan in the required EXECUTE/NAME/ACTION format; no explanations, markdown, or chat.
+{extra_sort_rules}
+""".strip()
+
+    def compose_output_verifier_user_prompt(self) -> str:
+        required_lines = "\n".join(
+            [f"NAME {agent_name} ACTION <one valid action>" for agent_name in self.robot_agent_names]
+        )
+        return f"""
+Verify and, if needed, correct the candidate dialog output.
+Return ONLY:
+EXECUTE
+{required_lines}
+""".strip()
+
+    def verify_output_plan(
+        self,
+        obs: EnvState,
+        candidate_response: str,
+        feedback_history: List[str],
+        save_path: str,
+        replan_idx: int,
+    ) -> str:
+        if self.debug_mode or candidate_response is None:
+            return candidate_response
+
+        system_prompt = self.compose_output_verifier_system_prompt(
+            obs=obs,
+            candidate_response=candidate_response,
+            feedback_history=feedback_history,
+        )
+        user_prompt = self.compose_output_verifier_user_prompt()
+        verifier_response, usage = self.query_once(
+            system_prompt,
+            user_prompt=user_prompt,
+            max_query=3,
+        )
+
+        timestamp = datetime.now().strftime("%m%d-%H%M")
+        tosave = [
+            {
+                "sender": "VerifierSystemPrompt",
+                "message": system_prompt,
+            },
+            {
+                "sender": "VerifierUserPrompt",
+                "message": user_prompt,
+            },
+            {
+                "sender": "CandidateDialog",
+                "message": candidate_response,
+            },
+            {
+                "sender": "Verifier",
+                "message": verifier_response,
+            },
+            usage,
+        ]
+        fname = f'{save_path}/replan{replan_idx}_output_verifier_{timestamp}.json'
+        json.dump(tosave, open(fname, 'w'))
+
+        # Keep a malformed verifier from destroying an otherwise parseable plan;
+        # parser + environment feedback still provide the hard validation layer.
+        if verifier_response and "EXECUTE" in verifier_response:
+            return verifier_response
+        return candidate_response
     
     def prompt_one_round(self, obs: EnvState, save_path: str = ""): 
         plan_feedbacks = []
@@ -161,6 +288,14 @@ class DialogPrompter:
                 save_path=save_path,
             )
             chat_history += agent_responses
+            candidate_response = final_response
+            final_response = self.verify_output_plan(
+                obs=obs,
+                candidate_response=candidate_response,
+                feedback_history=plan_feedbacks,
+                save_path=save_path,
+                replan_idx=i,
+            )
             parse_succ, parsed_str, llm_plans = self.parser.parse(obs, final_response) 
 
             curr_feedback = "None"

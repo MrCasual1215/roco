@@ -2,6 +2,7 @@ import os
 import copy
 import time
 import cv2 
+import re
 import random
 import numpy as np  
 from pydantic import dataclasses, validator 
@@ -54,7 +55,16 @@ Each <path> must contain exactly four <coord>s that smoothly interpolate between
 The robot PATHs must efficiently reach target while avoiding collision avoid collision (e.g. move above the objects' heights).
 The PATHs must do top-down pick or place: 
 - move directly atop an object by height 0.2 before PICK: e.g. Alice's gripper is at (0, 0, 0.3), banana is at (-0.25, 0.39, 0.29): NAME Alice ACTION PICK banana PATH [(0, 0.1, 0.3),(0, 0.2, 0.49),(-0.1, 0.25, 0.49),(-0.25, 0.39, 0.49)]
-- lift an object vertically up before moving it to PLACE: e.g. Bob's gripper is at (0.9, 0, 0.2), bin_front_left is at (0.35, 0.35, 0.43): NAME Bob ACTION PLACE apple bin_front_left PATH [(0.9,0.0,0.5), (0.5, 0, 0.5), (0.2, 0.1, 0.5),(0.35, 0.35, 0.5)]
+- lift an object vertically up before moving it to PLACE: e.g. Bob's gripper is at (0.9, 0, 0.2), bin_front_left is at (0.35, 0.35, 0.43): NAME Bob ACTION PLACE apple bin_front_left PATH [(0.90,0.00,0.55), (0.70,0.62,0.62), (0.52,0.60,0.62), (0.35,0.35,0.55)]
+
+[Packing PLACE path rule]
+When one or both robots PLACE held grocery items into the bin, use high and separated corridors instead of crossing through the table center.
+- Use z about 0.55-0.65 for the middle two PLACE waypoints, then descend only near the final bin slot.
+- If Alice and Bob both PLACE in the same round, choose non-adjacent/distant empty bin slots. The two target slot XY positions should be at least 0.35 apart. Avoid same-column, same-row-neighbor, and close diagonal pairs such as bin_back_middle with bin_front_right; instead prefer opposite-side pairs such as Alice->bin_back_left and Bob->bin_front_right when both are empty.
+- If Alice and Bob both PLACE in the same round, do NOT route both robots through the central low area around x=0.0-0.35, y=0.45-0.58, z<0.55. Keep same-index middle waypoints reasonably separated in XY (about 0.25 or more) until the final descent.
+- Alice should use a high left/front corridor: middle waypoints around x<=0.15, y<=0.52, z=0.60-0.68, then approach her final slot only at the last waypoint.
+- Bob should use a high back/right corridor: middle waypoints around y=0.60-0.70 and z=0.60-0.68 before approaching the bin. Use waypoints such as (0.45,0.64,0.64) or (0.60,0.64,0.64), not low/central waypoints.
+- In particular, Bob must avoid low or central middle waypoints near (0.20, 0.50, 0.40), (0.20,0.54,0.62), or (0.35,0.50,0.62); use high separated waypoints such as (0.45,0.64,0.64) or (0.60,0.64,0.64) instead.
 
 [Action Output Instruction]
 First output 'EXECUTE\n', then give exactly one ACTION per robot, each on a new line.
@@ -366,6 +376,57 @@ class PackGroceryTask(MujocoSimEnv):
     
     def describe_task_context(self):
         return PACK_TASK_CONTEXT
+
+    def get_occupied_bin_slots(
+        self,
+        exclude_items: Optional[Set[str]] = None,
+        xy_threshold: float = 0.14,
+    ) -> Dict[str, List[str]]:
+        """Return bin slots that already contain or are very close to items.
+
+        The text observation labels an object as inside the nearest slot when it
+        contacts the bin, but late-stage packing can still fail if a new object
+        is placed close to an already packed item.  Use XY distance to slot
+        centers as an additional guard and ignore items currently being placed.
+        """
+        exclude_items = exclude_items or set()
+        occupied = {slot_name: [] for slot_name in self.bin_slot_xposes}
+
+        try:
+            obs = self.get_obs()
+        except Exception:
+            obs = None
+
+        for item_name in self.item_names:
+            if item_name in exclude_items:
+                continue
+
+            try:
+                item_xy = self.physics.data.site(f"{item_name}_top").xpos[:2]
+            except KeyError:
+                continue
+
+            nearest_slot = None
+            nearest_dist = float("inf")
+            for slot_name, slot_xpos in self.bin_slot_xposes.items():
+                dist = float(np.linalg.norm(item_xy - slot_xpos[:2]))
+                if dist < nearest_dist:
+                    nearest_slot = slot_name
+                    nearest_dist = dist
+
+            item_contacts = []
+            if obs is not None:
+                try:
+                    item_contacts = obs.objects[item_name].contacts
+                except Exception:
+                    item_contacts = []
+
+            if nearest_slot is not None and (
+                nearest_dist < xy_threshold or "bin_inside" in item_contacts
+            ):
+                occupied[nearest_slot].append(item_name)
+
+        return {slot: items for slot, items in occupied.items() if len(items) > 0}
     
     def get_agent_prompt(self, obs, agent_name):        
         robot_name = self.get_robot_name(agent_name)
@@ -389,6 +450,7 @@ You see the following objects:
 {object_desp}
 {robot_desp}
 Your gripper must move higher than these objects and higher than table height {table_height:.2f}, but move lower than 0.8.
+For PLACE in the packing task, first lift to a high carrying corridor. If both robots PLACE, choose non-adjacent/distant empty bin slots whose XY positions are at least 0.35 apart; avoid close pairs such as bin_back_middle with bin_front_right, and prefer opposite-side pairs such as Alice->bin_back_left and Bob->bin_front_right when possible. Keep corridors separated until final descent: Alice should use a high left/front corridor with middle waypoints around x<=0.15, y<=0.52, z=0.60-0.68, while Bob should use a high back/right corridor with middle waypoints around y=0.60-0.70 and z=0.60-0.68. Bob must avoid low/central middle waypoints near (0.20, 0.50, 0.40), (0.20,0.54,0.62), or (0.35,0.50,0.62). Same-index middle waypoints should stay about 0.25 or more apart in XY.
 Never forget you are {agent_name}!
 Think step-by-step about the task and {other_robot}'s response. Carefully check and correct {other_robot} if they made a mistake. 
 Discuss with {other_robot} to come up with the best plan and smooth, collision-free paths. 
@@ -405,6 +467,156 @@ End your response by either: 1) output PROCEED, if the plans require further dis
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'PICK' not in action_str and 'PLACE' not in action_str:
                 feedback += f"{agent_name}'s ACTION is invalid, can only PICK or PLACE"
+
+        placing_items = set()
+        place_slots = {}
+        for agent_name, action_str in llm_plan.action_strs.items():
+            match = re.search(r"\bPLACE\s+(\S+)\s+(bin_\S+)\s+PATH\b", action_str)
+            if match:
+                placing_items.add(match.group(1))
+                place_slots[agent_name] = match.group(2)
+
+        # Reject PLACE targets that are already occupied by previously packed
+        # items.  This catches failures such as run_28, where bread/cereal were
+        # repeatedly planned into slots already containing soda_can/milk.
+        if len(place_slots) > 0:
+            occupied_slots = self.get_occupied_bin_slots(exclude_items=placing_items)
+            for agent_name, slot_name in place_slots.items():
+                blocking_items = occupied_slots.get(slot_name, [])
+                if len(blocking_items) > 0:
+                    empty_slots = [
+                        slot for slot in PACK_BIN_SITE_NAMES
+                        if slot not in occupied_slots and slot not in place_slots.values()
+                    ]
+                    empty_slot_msg = (
+                        f" Empty slots appear to be: {', '.join(empty_slots)}."
+                        if len(empty_slots) > 0
+                        else ""
+                    )
+                    feedback += (
+                        f"{agent_name} cannot PLACE into {slot_name}: that slot "
+                        f"is already occupied or too close to packed item(s) "
+                        f"{', '.join(blocking_items)}. Choose a truly empty bin "
+                        f"slot away from existing packed items.{empty_slot_msg} "
+                    )
+
+        # Packing-specific path sanity checks.  The generic waypoint collision
+        # checks only test each discrete waypoint; a low path through the table
+        # center can still pass those checks but make the downstream BiRRT spend
+        # a long time searching around narrow passages.  Reject those plans early
+        # and ask the LLM to use the high separated corridors described above.
+        if all('PLACE' in action_str for action_str in llm_plan.action_strs.values()):
+            # Do not let simultaneous PLACE actions target adjacent/nearby slots:
+            # in practice this frequently puts both grippers into the same narrow
+            # bin region during the final descent (e.g. milk->bin_back_middle and
+            # soda_can->bin_front_right in run_24).
+            if len(place_slots) == len(llm_plan.action_strs):
+                alice_slot = place_slots.get("Alice")
+                bob_slot = place_slots.get("Bob")
+                if (
+                    alice_slot in self.bin_slot_xposes
+                    and bob_slot in self.bin_slot_xposes
+                ):
+                    slot_dist = np.linalg.norm(
+                        self.bin_slot_xposes[alice_slot][:2]
+                        - self.bin_slot_xposes[bob_slot][:2]
+                    )
+                    if slot_dist < 0.35:
+                        feedback += (
+                            f"Simultaneous PLACE target slots are too close: "
+                            f"Alice->{alice_slot} and Bob->{bob_slot} are only "
+                            f"{slot_dist:.2f} apart in XY. Choose non-adjacent, "
+                            "distant empty slots with XY separation at least 0.35. "
+                            "Avoid close pairs such as bin_back_middle with "
+                            "bin_front_right; prefer opposite-side pairs such as "
+                            "Alice->bin_back_left and Bob->bin_front_right when "
+                            "both slots are empty. "
+                        )
+
+            alice_waypoints = llm_plan.ee_waypoint_poses.get("Alice", [])
+            bob_waypoints = llm_plan.ee_waypoint_poses.get("Bob", [])
+            alice_mid_positions = np.array(
+                [pose.position for pose in alice_waypoints[1:-1]]
+            ) if len(alice_waypoints) > 2 else np.empty((0, 3))
+            bob_mid_positions = np.array(
+                [pose.position for pose in bob_waypoints[1:-1]]
+            ) if len(bob_waypoints) > 2 else np.empty((0, 3))
+
+            if len(alice_mid_positions) > 0:
+                ax = alice_mid_positions[:, 0]
+                ay = alice_mid_positions[:, 1]
+                az = alice_mid_positions[:, 2]
+                if np.any(az < 0.58):
+                    feedback += (
+                        "Alice's PLACE path is not lifted high enough for "
+                        "simultaneous PLACE. Alice should use middle waypoints "
+                        "at z about 0.60-0.68 before the final slot approach. "
+                    )
+                if np.any((ax > 0.15) | (ay > 0.52)):
+                    feedback += (
+                        "Alice's simultaneous PLACE middle waypoints are too "
+                        "central/right or too far back. Alice should stay in a "
+                        "high left/front corridor with middle waypoints around "
+                        "x<=0.15, y<=0.52, z=0.60-0.68, and only approach the "
+                        "target slot at the last waypoint. "
+                    )
+
+            if len(bob_mid_positions) > 0:
+                x = bob_mid_positions[:, 0]
+                y = bob_mid_positions[:, 1]
+                z = bob_mid_positions[:, 2]
+                low_middle_mask = (
+                    (x >= 0.0) & (x <= 0.35) &
+                    (y >= 0.45) & (y <= 0.58) &
+                    (z < 0.55)
+                )
+                if np.any(low_middle_mask):
+                    feedback += (
+                        "Bob's PLACE path uses a low middle-table waypoint, "
+                        "which often makes RRT planning hang. For simultaneous "
+                        "PLACE actions, Bob must route through a high back/right "
+                        "corridor: use middle waypoints with y around 0.58-0.68 "
+                        "and z around 0.60-0.65, e.g. avoid (0.20,0.50,0.40) "
+                        "and use (0.25,0.62,0.62) or (0.45,0.62,0.62). "
+                    )
+
+                if np.max(z) < 0.58:
+                    feedback += (
+                        "Bob's PLACE path is not lifted high enough. During "
+                        "simultaneous PLACE, Bob should lift the held object to "
+                        "z about 0.60-0.65 before moving toward the bin. "
+                    )
+                if np.any(y < 0.60):
+                    feedback += (
+                        "Bob's simultaneous PLACE middle waypoints are too "
+                        "central/front. Bob should stay in a high back/right "
+                        "corridor with middle waypoints around y=0.60-0.70 and "
+                        "z=0.60-0.68 before the final descent, e.g. "
+                        "(0.45,0.64,0.64) or (0.60,0.64,0.64). "
+                    )
+
+            if len(alice_mid_positions) > 0 and len(bob_mid_positions) > 0:
+                # Only compare same-time middle waypoints.  Comparing every
+                # Alice waypoint against every Bob waypoint is overly
+                # conservative and rejects otherwise usable plans when the
+                # two robots pass through nearby areas at different times.
+                num_pairs = min(len(alice_mid_positions), len(bob_mid_positions))
+                same_step_xy_dists = np.linalg.norm(
+                    alice_mid_positions[:num_pairs, :2] - bob_mid_positions[:num_pairs, :2],
+                    axis=-1,
+                )
+                min_xy_dist = float(np.min(same_step_xy_dists))
+                if min_xy_dist < 0.25:
+                    feedback += (
+                        f"Alice and Bob's simultaneous PLACE corridors are too "
+                        f"close at the same waypoint step before final descent: "
+                        f"minimum same-step middle-waypoint XY "
+                        f"separation is {min_xy_dist:.2f}. Keep Alice's and "
+                        "Bob's same-step middle waypoints about 0.25 or more "
+                        "apart in XY; Alice "
+                        "should use the high left/front corridor and Bob the high "
+                        "back/right corridor until the final descent. "
+                    )
         return feedback
  
  
@@ -424,4 +636,3 @@ if __name__ == "__main__":
     plt.imshow(img)
     plt.show()
     breakpoint()
-

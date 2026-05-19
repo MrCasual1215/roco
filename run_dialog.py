@@ -9,6 +9,7 @@ from glob import glob
 from natsort import natsorted
 from copy import deepcopy
 import argparse
+import traceback
 from typing import List, Tuple, Dict, Union, Optional, Any
 from collections import defaultdict
 import matplotlib.pyplot as plt
@@ -401,7 +402,48 @@ class LLMRunner:
             start_id = max(existing_run_ids) + 1
         for run_id in range(start_id, start_id + self.num_runs):
             print(f"==== Run {run_id} starts ====")
-            self.one_run(run_id)
+            try:
+                self.one_run(run_id)
+            except Exception as exc:
+                # Do not let one bad episode abort the whole evaluation.  This is
+                # especially important when a run times out or artifact generation
+                # hits a partially-written prompt JSON: mark this run as failed and
+                # continue with the next run_id so evaluator.py can count all runs.
+                print(f"Run {run_id} ERROR: {exc}")
+                traceback.print_exc()
+
+                run_dir = os.path.join(self.run_dir, f"run_{run_id}")
+                os.makedirs(run_dir, exist_ok=True)
+
+                # If one_run already wrote its result JSON before failing (for
+                # example, during HTML generation), keep that result. Otherwise
+                # create a failure result so this run is not reported as missing.
+                existing_results = glob(os.path.join(run_dir, "*.json"))
+                if len(existing_results) == 0:
+                    step_dirs = natsorted(glob(os.path.join(run_dir, "step_*")))
+                    if len(step_dirs) > 0:
+                        last_step_name = os.path.basename(step_dirs[-1])
+                        try:
+                            failed_step = int(last_step_name.split("_")[-1])
+                        except ValueError:
+                            failed_step = 0
+                    else:
+                        failed_step = 0
+
+                    result_path = os.path.join(run_dir, f"steps{failed_step}_success_False.json")
+                    with open(result_path, "w", encoding="utf8") as fp:
+                        json.dump(
+                            dict(
+                                step=failed_step,
+                                success=False,
+                                timed_out=False,
+                                error=type(exc).__name__,
+                                error_message=str(exc),
+                            ),
+                            fp,
+                        )
+                    print(f"Run {run_id} marked failed; result saved to {result_path}")
+                print(f"==== Run {run_id} failed; continuing to next run ====")
 
 def main(args):
     assert args.task in TASK_NAME_MAP.keys(), f"Task {args.task} not supported"

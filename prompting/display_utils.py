@@ -1,5 +1,6 @@
 import os 
 import json
+import logging
 from glob import glob
 from os.path import join
 from natsort import natsorted
@@ -243,7 +244,19 @@ def save_episode_html(
 
         json_data = []
         for json_file in json_files:
-            _data = json.load(open(json_file, 'r'))
+            if os.path.getsize(json_file) == 0:
+                logging.warning("Skipping empty prompt JSON while saving episode HTML: %s", json_file)
+                continue
+            try:
+                with open(json_file, 'r', encoding='utf8') as fp:
+                    _data = json.load(fp)
+            except json.JSONDecodeError as exc:
+                logging.warning(
+                    "Skipping invalid prompt JSON while saving episode HTML: %s (%s)",
+                    json_file,
+                    exc,
+                )
+                continue
             if isinstance(_data, dict):
                 _data = [_data]
             else:

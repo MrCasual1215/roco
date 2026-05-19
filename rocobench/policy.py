@@ -34,7 +34,7 @@ class PlannedPathPolicy:
         check_relative_pose: bool = False,
         allowed_collision_pairs: Optional[List[Tuple[int, int]]] = None,
         plan_splitted: bool = False,
-        timeout: int = 200,
+        timeout: int = 100,
     ):
         self.robot_names = robots.keys()
         self.robots = robots

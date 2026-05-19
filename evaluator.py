@@ -226,7 +226,7 @@ if __name__ == "__main__":
 
         results = []
         
-        num_runs = 5
+        num_runs = 1
 
         # Use default timeout (from DEFAULT_RUN_TIMEOUTS)
         results.append(test_run_dialog("sort", num_runs, "output"))

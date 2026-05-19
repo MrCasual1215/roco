@@ -158,6 +158,10 @@ class SingleThreadPrompter:
         """Use extra verifier only for the MakeSandwich task."""
         return self.env.__class__.__name__ == "MakeSandwichTask"
 
+    def _is_pack_task(self) -> bool:
+        """Use extra verifier only for the PackGrocery task."""
+        return self.env.__class__.__name__ == "PackGroceryTask"
+
     def _add_unique_limited(self, items: List[str], item: str, limit: int = 20):
         item = item.strip()
         if not item or item in items:
@@ -334,6 +338,109 @@ EXECUTE
             return verifier_response
         return candidate_response
 
+    def compose_pack_verifier_system_prompt(
+        self,
+        obs_desp: str,
+        candidate_response: str,
+        plan_feedbacks: List[str],
+    ) -> str:
+        """A PackGrocery-only second-stage verifier/corrector."""
+        task_desp = self.env.describe_task_context()
+        action_desp = self.env.get_action_prompt()
+        history_desp = self.compose_round_history() if self.use_history else ""
+        feedback_prompt = ""
+        if len(plan_feedbacks) > 0:
+            feedback_prompt = "Previous Plans Require Improvement:\n" + "\n".join(plan_feedbacks) + "\n"
+
+        return f"""
+{task_desp}
+{action_desp}
+{history_desp}
+{obs_desp}
+{feedback_prompt}
+{self._format_blacklist_prompt()}
+[Candidate Plan To Verify]
+{candidate_response}
+
+[Pack Verifier Rules]
+You are a strict verifier for PackGrocery only.
+Silently check the candidate plan before final output:
+1) Output format must be exactly EXECUTE followed by one NAME/ACTION line for every robot.
+2) Only PICK and PLACE are valid actions. Never output WAIT for PackGrocery.
+3) A robot with an empty gripper may PICK one grocery item that is still on the table. A robot holding an item must PLACE that held item into an empty bin slot.
+4) Never PLACE into an occupied bin slot shown in the scene. Treat a slot as occupied if any grocery item is described as "inside slot <slot>" or is already very close to that slot. For example, if milk is inside bin_front_right, do not PLACE cereal into bin_front_right; if soda_can is inside bin_back_left, do not PLACE bread into bin_back_left.
+5) Before choosing PLACE targets, infer the empty slots from the scene. Use only truly empty slots for newly placed objects. If the preferred distant pair uses an occupied slot, choose another empty pair instead.
+6) If both robots PLACE in the same round, their target slots should be non-adjacent/distant when possible: the target slot XY positions should be at least 0.35 apart. Avoid close pairs such as bin_back_middle with bin_front_right. However, occupied-slot avoidance is more important: never choose an occupied slot just to satisfy distance.
+7) If both robots PLACE in the same round, their middle waypoints must be high and separated until final descent. Alice should use a high left/front corridor with middle waypoints around x<=0.15, y<=0.52, z=0.60-0.68. Bob should use a high back/right corridor with middle waypoints around y=0.60-0.70, z=0.60-0.68.
+8) Bob must avoid low/central middle waypoints such as (0.20,0.50,0.40), (0.20,0.54,0.62), or (0.35,0.50,0.62). Prefer (0.45,0.64,0.64) or (0.60,0.64,0.64).
+9) Keep Alice/Bob same-index middle waypoint XY separation about 0.25 or more for simultaneous PLACE. Do not over-correct plans just because non-simultaneous middle waypoints are close.
+10) Respect previous environment feedback and do not repeat blacklisted failed plans.
+
+If the candidate plan is valid, output it unchanged.
+If it is invalid, output a corrected plan that obeys all PackGrocery rules.
+Return ONLY the executable plan in the required EXECUTE/NAME/ACTION/PATH format.
+""".strip()
+
+    def compose_pack_verifier_user_prompt(self) -> str:
+        agent_names = list(self.robot_agent_names)
+        required_lines = "\n".join(
+            [f"NAME {agent_name} ACTION <one valid action with PATH>" for agent_name in agent_names]
+        )
+        return f"""
+Verify and, if needed, correct the candidate PackGrocery plan.
+Return ONLY:
+EXECUTE
+{required_lines}
+""".strip()
+
+    def verify_pack_plan(
+        self,
+        obs_desp: str,
+        candidate_response: str,
+        plan_feedbacks: List[str],
+        save_path: str,
+        replan_idx: int,
+    ) -> str:
+        if not self._is_pack_task() or self.debug_mode:
+            return candidate_response
+
+        system_prompt = self.compose_pack_verifier_system_prompt(
+            obs_desp=obs_desp,
+            candidate_response=candidate_response,
+            plan_feedbacks=plan_feedbacks,
+        )
+        user_prompt = self.compose_pack_verifier_user_prompt()
+        verifier_response, usage = self.query_once(system_prompt, user_prompt=user_prompt)
+
+        timestamp = datetime.now().strftime("%m%d-%H%M")
+        tosave = [
+            {
+                "sender": "VerifierSystemPrompt",
+                "message": system_prompt,
+            },
+            {
+                "sender": "VerifierUserPrompt",
+                "message": user_prompt,
+            },
+            {
+                "sender": "CandidatePlanner",
+                "message": candidate_response,
+            },
+            {
+                "sender": "Verifier",
+                "message": verifier_response,
+            },
+            usage,
+        ]
+        fname = f'{save_path}/replan{replan_idx}_pack_verifier_{timestamp}.json'
+        json.dump(tosave, open(fname, 'w'))
+
+        # Keep a malformed verifier from destroying an otherwise parseable plan;
+        # the normal parser+feedback path will still reject invalid candidates.
+        if verifier_response and "EXECUTE" in verifier_response:
+            return verifier_response
+        return candidate_response
+
     def compose_round_history(self):
         if len(self.round_history) == 0:
             return ""
@@ -440,6 +547,13 @@ Your response is:
             response = self.verify_sandwich_plan(
                 obs_desp=obs_desp,
                 candidate_response=candidate_response,
+                plan_feedbacks=plan_feedbacks,
+                save_path=save_path,
+                replan_idx=i,
+            )
+            response = self.verify_pack_plan(
+                obs_desp=obs_desp,
+                candidate_response=response,
                 plan_feedbacks=plan_feedbacks,
                 save_path=save_path,
                 replan_idx=i,
