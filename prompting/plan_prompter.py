@@ -2,6 +2,7 @@ import os
 import json
 import pickle 
 import requests
+import re
 import numpy as np
 from rocobench.envs import MujocoSimEnv, EnvState
 import openai
@@ -126,6 +127,8 @@ class SingleThreadPrompter:
         self.round_history = [] # [obs_t, action_t] but only if action_t got executed
         self.failed_plans = [] # could inherit from previous round if the final plan failed to execute in env.
         self.unresolved_plan_feedbacks = [] # carry LLM parse/env feedback across runner steps if no plan was executable
+        self.failed_action_blacklist = [] # exact invalid single-robot actions that should not be repeated
+        self.failed_plan_blacklist = [] # exact invalid multi-robot plan patterns that should not be repeated
         self.response_history = [] # [response_t]
         
 
@@ -134,6 +137,8 @@ class SingleThreadPrompter:
             round_history=self.round_history,
             failed_plans=self.failed_plans,
             unresolved_plan_feedbacks=self.unresolved_plan_feedbacks,
+            failed_action_blacklist=self.failed_action_blacklist,
+            failed_plan_blacklist=self.failed_plan_blacklist,
         )
         save_path = os.path.join(save_path, fname)
         with open(save_path, "wb") as f:
@@ -146,6 +151,188 @@ class SingleThreadPrompter:
         self.round_history = state_dict["round_history"]
         self.failed_plans = state_dict["failed_plans"]
         self.unresolved_plan_feedbacks = state_dict.get("unresolved_plan_feedbacks", [])
+        self.failed_action_blacklist = state_dict.get("failed_action_blacklist", [])
+        self.failed_plan_blacklist = state_dict.get("failed_plan_blacklist", [])
+
+    def _is_makesandwich_task(self) -> bool:
+        """Use extra verifier only for the MakeSandwich task."""
+        return self.env.__class__.__name__ == "MakeSandwichTask"
+
+    def _add_unique_limited(self, items: List[str], item: str, limit: int = 20):
+        item = item.strip()
+        if not item or item in items:
+            return
+        items.append(item)
+        del items[:-limit]
+
+    def _plan_action_lines(self, llm_plan) -> List[str]:
+        if llm_plan is None:
+            return []
+        lines = []
+        for agent_name, action_str in llm_plan.action_strs.items():
+            lines.append(f"NAME {agent_name} ACTION {action_str}")
+        return lines
+
+    def _remember_failed_actions(self, feedback: str, failed_llm_plan=None):
+        """Build a prompt-level blacklist from failed env feedback.
+
+        Keep this conservative: blacklist exact failed full-plan patterns for all
+        failures, and blacklist individual actions only when feedback identifies
+        a concrete illegal action (e.g. bad recipe order).
+        """
+        if not feedback or feedback == "None" or failed_llm_plan is None:
+            return
+
+        proposal = getattr(failed_llm_plan, "parsed_proposal", "").strip()
+        if proposal:
+            self._add_unique_limited(self.failed_plan_blacklist, proposal, limit=12)
+
+        action_lines = self._plan_action_lines(failed_llm_plan)
+        action_by_obj = []
+        for line in action_lines:
+            # Match the object being PUT/PICK so feedback can identify the bad action.
+            put_m = re.search(r"\bACTION\s+PUT\s+([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)", line)
+            pick_m = re.search(r"\bACTION\s+PICK\s+([A-Za-z0-9_]+)", line)
+            if put_m:
+                action_by_obj.append(("PUT", put_m.group(1), line))
+            if pick_m:
+                action_by_obj.append(("PICK", pick_m.group(1), line))
+
+        # Recipe-order feedback names the illegally PUT object:
+        # "recipe says cheese must be put on tomato"
+        bad_put_objs = set(re.findall(r"recipe says\s+([A-Za-z0-9_]+)\s+must be put on", feedback))
+        for action_type, obj, line in action_by_obj:
+            if action_type == "PUT" and obj in bad_put_objs:
+                self._add_unique_limited(self.failed_action_blacklist, line)
+
+        # Feedback for already-stacked objects names the illegal PICK object:
+        # "Chad cannot PICK cucumber, it's already stacked"
+        bad_pick_objs = set(re.findall(r"cannot PICK\s+([A-Za-z0-9_]+)", feedback))
+        for action_type, obj, line in action_by_obj:
+            if action_type == "PICK" and obj in bad_pick_objs:
+                self._add_unique_limited(self.failed_action_blacklist, line)
+
+    def _format_blacklist_prompt(self) -> str:
+        if len(self.failed_action_blacklist) == 0 and len(self.failed_plan_blacklist) == 0:
+            return ""
+
+        prompt = """
+[Failed Action Blacklist]
+The following are known failed actions or failed plan patterns for the current unresolved situation.
+Do NOT repeat any blacklisted individual action. If a robot is holding a future ingredient that it cannot legally PUT yet, make that robot WAIT.
+Do NOT repeat any blacklisted whole-plan pattern exactly; change the invalid robot action, usually to WAIT, while preserving valid progress by the other robot.
+"""
+        if len(self.failed_action_blacklist) > 0:
+            prompt += "Blacklisted individual actions:\n"
+            for action in self.failed_action_blacklist[-12:]:
+                prompt += f"- {action}\n"
+        if len(self.failed_plan_blacklist) > 0:
+            prompt += "Blacklisted whole-plan patterns:\n"
+            for plan in self.failed_plan_blacklist[-6:]:
+                one_line = " | ".join([ln.strip() for ln in plan.splitlines() if ln.strip()])
+                prompt += f"- {one_line}\n"
+        prompt += "\n"
+        return prompt
+
+    def compose_verifier_system_prompt(
+        self,
+        obs_desp: str,
+        candidate_response: str,
+        plan_feedbacks: List[str],
+    ) -> str:
+        """A MakeSandwich-only second-stage verifier/corrector."""
+        task_desp = self.env.describe_task_context()
+        action_desp = self.env.get_action_prompt()
+        history_desp = self.compose_round_history() if self.use_history else ""
+        feedback_prompt = ""
+        if len(plan_feedbacks) > 0:
+            feedback_prompt = "Previous Plans Require Improvement:\n" + "\n".join(plan_feedbacks) + "\n"
+
+        return f"""
+{task_desp}
+{action_desp}
+{history_desp}
+{obs_desp}
+{feedback_prompt}
+{self._format_blacklist_prompt()}
+[Candidate Plan To Verify]
+{candidate_response}
+
+[Sandwich Verifier Rules]
+You are a strict verifier for MakeSandwich only.
+Silently check the recipe order before final output:
+1) Determine the current stack on cutting_board from the scene and history.
+2) Determine the next required ingredient in the recipe.
+3) A PUT is valid only when the PUT object is exactly the next required ingredient and the target is exactly its immediate predecessor/top of stack.
+4) A robot may PUT an item only if that robot is currently holding that item. If the next required ingredient is still on the table, the valid progress action is to PICK it with a reachable empty-gripper robot.
+5) If a robot holds a future ingredient whose predecessor is not yet stacked, that robot must WAIT; never PUT the future ingredient early.
+6) Only one robot may PUT in one round.
+7) Never repeat a blacklisted individual action or exact failed plan pattern.
+
+If the candidate plan is valid, output it unchanged.
+If it is invalid, output a corrected plan. Prefer replacing only the invalid robot action with WAIT while preserving any valid PICK/PUT that advances the next required ingredient.
+Return ONLY the executable plan in the required EXECUTE/NAME/ACTION format.
+""".strip()
+
+    def compose_verifier_user_prompt(self) -> str:
+        agent_names = list(self.robot_agent_names)
+        required_lines = "\n".join(
+            [f"NAME {agent_name} ACTION <one valid action>" for agent_name in agent_names]
+        )
+        return f"""
+Verify and, if needed, correct the candidate MakeSandwich plan.
+Return ONLY:
+EXECUTE
+{required_lines}
+""".strip()
+
+    def verify_sandwich_plan(
+        self,
+        obs_desp: str,
+        candidate_response: str,
+        plan_feedbacks: List[str],
+        save_path: str,
+        replan_idx: int,
+    ) -> str:
+        if not self._is_makesandwich_task() or self.debug_mode:
+            return candidate_response
+
+        system_prompt = self.compose_verifier_system_prompt(
+            obs_desp=obs_desp,
+            candidate_response=candidate_response,
+            plan_feedbacks=plan_feedbacks,
+        )
+        user_prompt = self.compose_verifier_user_prompt()
+        verifier_response, usage = self.query_once(system_prompt, user_prompt=user_prompt)
+
+        timestamp = datetime.now().strftime("%m%d-%H%M")
+        tosave = [
+            {
+                "sender": "VerifierSystemPrompt",
+                "message": system_prompt,
+            },
+            {
+                "sender": "VerifierUserPrompt",
+                "message": user_prompt,
+            },
+            {
+                "sender": "CandidatePlanner",
+                "message": candidate_response,
+            },
+            {
+                "sender": "Verifier",
+                "message": verifier_response,
+            },
+            usage,
+        ]
+        fname = f'{save_path}/replan{replan_idx}_verifier_{timestamp}.json'
+        json.dump(tosave, open(fname, 'w'))
+
+        # Keep a malformed verifier from destroying an otherwise parseable plan;
+        # the normal parser+feedback path will still reject invalid candidates.
+        if verifier_response and "EXECUTE" in verifier_response:
+            return verifier_response
+        return candidate_response
 
     def compose_round_history(self):
         if len(self.round_history) == 0:
@@ -184,6 +371,8 @@ class SingleThreadPrompter:
             feedback_prompt = "Previous Plans Require Improvement:\n"
             feedback_prompt += "\n".join(plan_feedbacks) + "\n"
             full_prompt += feedback_prompt
+
+        full_prompt += self._format_blacklist_prompt()
         
         if self.comm_mode == "plan":
             comm_prompt = get_plan_prompt(self.env)
@@ -247,6 +436,14 @@ Your response is:
             response, usage = self.query_once(
                 system_prompt, user_prompt=user_prompt
                 )
+            candidate_response = response
+            response = self.verify_sandwich_plan(
+                obs_desp=obs_desp,
+                candidate_response=candidate_response,
+                plan_feedbacks=plan_feedbacks,
+                save_path=save_path,
+                replan_idx=i,
+            )
             response_history.append(response)
             
             timestamp = datetime.now().strftime("%m%d-%H%M")
@@ -261,6 +458,10 @@ Your response is:
                     },
                     {
                         "sender": "Planner",
+                        "message": candidate_response,
+                    },
+                    {
+                        "sender": "VerifiedPlanner" if response != candidate_response else "PlannerUsed",
                         "message": response,
                     },
                     usage,
@@ -269,6 +470,7 @@ Your response is:
             json.dump(tosave, open(fname, 'w'))  
             
             curr_feedback = "None"
+            failed_llm_plan = None
             # try parsing 
             parse_succ, parsed_str, llm_plans = self.parser.parse(obs, response) 
             if not parse_succ: 
@@ -286,9 +488,11 @@ Re-format to strictly follow [Action Output Instruction]!
                     ready_to_execute, env_feedback = self.feedback_manager.give_feedback(llm_plan)        
                     if not ready_to_execute:
                         curr_feedback = env_feedback
+                        failed_llm_plan = llm_plan
                         break
             
             if curr_feedback != "None":
+                self._remember_failed_actions(curr_feedback, failed_llm_plan)
                 plan_feedbacks.append(curr_feedback)
             tosave = [
                 {
@@ -357,6 +561,8 @@ Re-format to strictly follow [Action Output Instruction]!
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
             self.unresolved_plan_feedbacks = []
+            self.failed_action_blacklist = []
+            self.failed_plan_blacklist = []
             responses = "\n".join(self.response_history)
             self.round_history.append(
                 f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
@@ -372,4 +578,6 @@ Re-format to strictly follow [Action Output Instruction]!
         self.round_history = []
         self.failed_plans = [] 
         self.unresolved_plan_feedbacks = []
+        self.failed_action_blacklist = []
+        self.failed_plan_blacklist = []
         self.response_history = []

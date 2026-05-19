@@ -184,6 +184,15 @@ CSS_CODE = """
         .Dave-bubble {
         background-color: #918d84;
         } 
+        .VerifiedPlanner-bubble {
+        background-color: #d7c6ff;
+        }
+        .Verifier-bubble {
+        background-color: #c6e2ff;
+        }
+        .CandidatePlanner-bubble {
+        background-color: #e6d6c8;
+        }
         .Solution-bubble {
         background-color: #fff3a8;
         }

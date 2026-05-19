@@ -43,6 +43,8 @@ There's an obstacle block wall between the rope and the groove, so the robots mu
 The rope is heavy, so they must hold the rope at the same time, and distance between their grippers must stay fixed, so the rope doesn't drop.
 At each round, if given 'Scene description' and 'Environment feedback', use it to reason about the task and improve any previous plans. 
 Each robot should reach for the closet target, if a robot failed IK to reach a goal, change strategy to a different action.
+Do not hard-code which robot picks which rope end. Assign rope_front_end and rope_back_end dynamically by reachability: if one robot fails IK for a rope end, that robot should try the other rope end and the other robot should take the remaining end. The two robots must pick different rope ends.
+For PUT actions, each robot must PUT the rope end it is actually holding. Prefer robot-specific groove targets: Alice puts her held rope end to groove_right_end, and Bob puts his held rope end to groove_left_end.
 """
 
 ROPE_ACTION_SPACE="""
@@ -56,9 +58,24 @@ The PATHs must do top-down pick or place:
 - move directly atop the rope's end by height 0.2 before PICK: e.g. Alice's gripper is at (0, 0, 0.3), rope_front_end is at (-0.25, 0.39, 0.29): ACTION PICK rope_front_end PATH [(0, 0.1, 0.3),(0, 0.2, 0.49),(-0.1, 0.25, 0.49),(-0.25, 0.39, 0.49)]
 - lift rope up before moving it to PUT: e.g. Bob's gripper is at (0.9, 0, 0.2), groove_left_end is at (0.35, 0.35, 0.43): ACTION PLACE rope_front_end groove_left_end PATH [(0.9,0.0,0.5), (0.5, 0, 0.5), (0.2, 0.1, 0.5),(0.35, 0.35, 0.5)]
 
+[Rope placement strategy]
+- Dynamically assign PICK targets by reachability. Do NOT always force Bob to PICK rope_back_end. If Bob has IK failure on rope_back_end, switch to Bob PICK rope_front_end and Alice PICK rope_back_end.
+- The two robots must PICK different rope ends; never have both robots PICK the same rope end.
+- If Bob fails IK while picking rope_back_end near the table front, use a swapped PICK plan like:
+  NAME Alice ACTION PICK rope_back_end PATH [(0.09, -0.07, 0.51), (-0.10, 0.00, 0.51), (-0.30, 0.10, 0.42), (-0.47, 0.19, 0.32)]
+  NAME Bob ACTION PICK rope_front_end PATH [(0.05, 1.10, 0.62), (-0.30, 0.95, 0.55), (-0.75, 0.75, 0.45), (-1.11, 0.50, 0.32)]
+- During PUT, each robot must PUT the rope end it is holding. Prefer Alice placing her held end at groove_right_end and Bob placing his held end at groove_left_end.
+- If a direct high lift at the current x,y fails IK, do NOT repeat the same first waypoint. Lift gradually while translating, for example through z about 0.35, 0.42, 0.52, then 0.54.
+- The obstacle wall top is close to the allowed height limit. A path around/over the wall should use z about 0.52-0.54 near the wall; z around 0.40 is too low and likely collides.
+- If Alice holds rope_front_end and Bob holds rope_back_end, preferred PUT template:
+  NAME Alice ACTION PUT rope_front_end groove_right_end PATH [(-1.21, 0.62, 0.35), (-0.80, 0.59, 0.42), (-0.20, 0.55, 0.52), (0.40, 0.52, 0.54)]
+  NAME Bob ACTION PUT rope_back_end groove_left_end PATH [(-0.53, 0.79, 0.35), (-0.35, 0.75, 0.42), (-0.15, 0.68, 0.52), (0.05, 0.58, 0.54)]
+- If Alice holds rope_back_end and Bob holds rope_front_end, swap the object names but keep Alice going to groove_right_end and Bob going to groove_left_end.
+
 [Action Output Instruction]
 First output 'EXECUTE\n', then give exactly one ACTION per robot, each on a new line.
 Example: 'EXECUTE\nNAME Alice ACTION PUT rope_front_end groove_right_end PATH <path>\nNAME Bob ACTION PUT rope_back_end groove_left_end PATH <path>\n'
+If Alice is holding rope_back_end and Bob is holding rope_front_end, swap the object names in the PUT example: Alice PUT rope_back_end groove_right_end and Bob PUT rope_front_end groove_left_end.
 """
 
 ROPE_TASK_CHAT_PROMPT="""They discuss to find the best paths. Carefully consider environment feedback and others' responses. Robots must coordinate paths to avoid collision.
@@ -399,6 +416,7 @@ You two must lift up the rope together, each grasping one side of the rope.
 There's an obstacle block wall between rope and groove, so both of you must lift the rope **high** above the obstacle block top before putting it into the groove.
 The rope is heavy, so you must always pick and put the rope at the same time.
 Distance between your grippers must stay fixed, so the rope doesn't drop.
+Do not hard-code which robot picks which rope end. Assign rope ends by reachability. If a robot fails IK for one rope end, it should try the other rope end while the other robot takes the remaining end. During PUT, Alice should place her held rope end at groove_right_end and Bob should place his held rope end at groove_left_end.
 
 Your gripper must move lower than 0.55 but higher than table height {table_height:.2f}
 At the current round: 

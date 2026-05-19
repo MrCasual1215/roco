@@ -338,7 +338,7 @@ class LLMRunner:
             save_dir,
             html_fname=f"steps{step}_success_{success}",
             video_fname="execute.mp4",
-            sender_keys=["Alice", "Bob", "Chad", "Dave", "Planner", "Feedback", "Action"],
+            sender_keys=["Alice", "Bob", "Chad", "Dave", "Planner", "VerifiedPlanner", "CandidatePlanner", "Verifier", "Feedback", "Action"],
             )
         print(f"Episode html saved to {save_dir}")
 

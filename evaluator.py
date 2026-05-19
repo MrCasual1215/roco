@@ -225,14 +225,16 @@ if __name__ == "__main__":
         begin_time = time_module.time()
 
         results = []
+        
+        num_runs = 1
 
         # Use default timeout (from DEFAULT_RUN_TIMEOUTS)
-        results.append(test_run_dialog("sort", 5, "output"))
-        results.append(test_run_dialog("cabinet", 5, "output"))
-        results.append(test_run_dialog("rope", 5, "output"))
-        results.append(test_run_dialog("sweep", 5, "output"))
-        results.append(test_run_dialog("sandwich", 5, "output"))
-        results.append(test_run_dialog("pack", 5, "output"))
+        results.append(test_run_dialog("sort", num_runs, "output"))
+        results.append(test_run_dialog("cabinet", num_runs, "output"))
+        results.append(test_run_dialog("rope", num_runs, "output"))
+        results.append(test_run_dialog("sweep", num_runs, "output"))
+        results.append(test_run_dialog("sandwich", num_runs, "output"))
+        results.append(test_run_dialog("pack", num_runs, "output"))
 
         end_time = time_module.time()
         total_elapsed = end_time - begin_time
