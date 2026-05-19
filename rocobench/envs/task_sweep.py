@@ -47,6 +47,25 @@ SWEEP_ACTION_SPACE="""
 3) WAIT, stays at the current spot.
 4) DUMP, only when there are one or more cubes in the dustpan, Alice can DUMP it into trash_bin.
 Only SWEEP a cube after both robots MOVEed to the cube.
+If both Alice and Bob have already MOVEed to the same cube, do not MOVE again.
+Alignment rule before SWEEP:
+A cube is ready to SWEEP only when both conditions are true:
+1) Alice/dustpan is close to the target cube: Alice's distance to that cube is less than 0.20.
+2) Bob/broom is close to the target cube: Bob's distance to that cube is less than 0.45.
+If either distance is larger than these thresholds, the robots are NOT aligned and Bob must NOT SWEEP.
+Only if both Alice and Bob are already aligned with the same on-table cube:
+- Alice must WAIT.
+- Bob must SWEEP that same cube.
+If Alice and Bob are not aligned with the same on-table cube, both robots must MOVE to the same on-table cube first.
+Never SWEEP a cube just because it remains on the table.
+After DUMP, if any cube is still on the table, both robots must MOVE to that cube before SWEEP.
+Before outputting SWEEP <target>, check the Scene description:
+- Alice must be in front of <target> with distance < 0.20.
+- Bob must be in front of <target> with distance < 0.45.
+If not, output MOVE <target> for both robots.
+Do not SWEEP a cube if Alice is aligned with a different cube.
+Do not SWEEP a cube if Bob is aligned with a different cube.
+Do not SWEEP a cube that was not the target of both robots' latest MOVE action.
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give exactly one action per robot, put each on a new line.
 Example#1: 'EXECUTE\nNAME Alice ACTION MOVE red_cube\nNAME Bob ACTION MOVE red_cube\n'
@@ -56,6 +75,7 @@ Example#3: 'EXECUTE\nNAME Alice ACTION DUMP\nNAME Bob ACTION MOVE green_cube\n'
 
 SWEEP_CHAT_PROMPT="""They discuss to find the best strategy. When each robot talk, it first reflects on the task status and its own capability. 
 Carefully consider environment feedback and others' responses. Coordinate with other robots to always sweep the same cube.
+Before agreeing to SWEEP, Alice and Bob must explicitly verify that they are aligned with the same cube using the distance thresholds: Alice < 0.20 and Bob < 0.45. If not aligned, they must agree to MOVE to the same cube instead of SWEEP.
 They talk in order [Alice],[Bob],[Alice],..., then, after reaching agreement, plan exactly one action per robot, output an EXECUTE to summarize the plan, and stop talking.
 Their entire chat history and the final plan are: """
 
@@ -502,5 +522,3 @@ if __name__ == "__main__":
     # 
     # plt.show()
     # im.save('sorting_seed0.jpg')
-
-
