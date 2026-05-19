@@ -421,12 +421,51 @@ class LLMResponseParser:
         # update the target quat!
         place_target_pose[3:] = pick_target_pose[3:]
 
+        tograsp = pick_plan[0]['tograsp']
+        obj_name, obj_site = tograsp[0], tograsp[1]
+
+        # Cabinet cup/mug placement is sensitive: a direct diagonal move can
+        # release the object slightly off target, and a later re-pick from the
+        # table may become IK-infeasible.  Split PICK+PLACE into:
+        # pick -> original place target -> lower 0.1m and release.
+        if self.env.__class__.__name__ == 'CabinetTask' and obj_name in ['cup', 'mug']:
+            preplace_target_pose = place_target_pose.copy()
+            lower_place_target_pose = place_target_pose.copy()
+            lower_place_target_pose[2] -= 0.10
+            preplace_waypoints = self.add_direct_waypoints(
+                ee_start=pick_target_pose,
+                ee_target=preplace_target_pose,
+            )
+            lower_waypoints = self.add_direct_waypoints(
+                ee_start=preplace_target_pose,
+                ee_target=lower_place_target_pose,
+            )
+            inhand = (obj_name, obj_site, self.env.get_object_joint_name(obj_name))
+
+            preplace_plan = dict(
+                robot_name=agent_name,
+                ee_targets=preplace_target_pose,
+                ee_waypoints=preplace_waypoints,
+                tograsp=None,
+                inhand=inhand,
+                action_strs=action_desp,
+                return_home=False,
+            )
+            lower_place_plan = dict(
+                robot_name=agent_name,
+                ee_targets=lower_place_target_pose,
+                ee_waypoints=lower_waypoints,
+                tograsp=(obj_name, obj_site, 0),
+                inhand=inhand,
+                action_strs=action_desp,
+                return_home=True,
+            )
+            return True, "parse success", [pick_plan[0], preplace_plan, lower_place_plan]
+
         place_waypoints = self.add_direct_waypoints(
             ee_start=pick_target_pose,
             ee_target=place_target_pose,
         )
-        tograsp = pick_plan[0]['tograsp']
-        obj_name, obj_site = tograsp[0], tograsp[1]
         
         place_plan = dict(
             robot_name=agent_name,

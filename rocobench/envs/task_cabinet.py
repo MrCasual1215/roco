@@ -47,6 +47,8 @@ Example: 'EXECUTE\nNAME Alice ACTION PICK mug PLACE mug_coaster\nNAME Bob ACTION
 
 CABINET_TASK_CONTEXT="""3 robots, Alice, Bob, Chad together must take a mug and a cup out of a cabinet and place them on the correct coasters.
 Both left and right cabinet doors should be OPENed and stays open before anything inside can be PICKed and PLACEed. Robots must coordinate to complete the task most efficiently while avoiding collision.
+When the cabinet is on the left side, Alice can reach left_door_handle, mug, and cup; Bob can reach right_door_handle; Chad can reach right_door_handle, mug, and cup.
+When the cabinet is on the right side, Alice can reach left_door_handle; Bob can reach left_door_handle, mug, and cup; Chad can reach right_door_handle, mug, and cup.
 At each round, given 'Scene description' and 'Environment feedback', use it to reason about the task, and improve any previous plans. 
 Each robot does **exactly** one ACTION per round, selected from only one of the above 4 options.
 """

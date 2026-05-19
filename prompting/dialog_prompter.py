@@ -32,8 +32,15 @@ def _query_openai_compatible_chat(
         api_key=os.environ.get("OPENAI_API_KEY", "ollama"),
     )
     messages = [{"role": "system", "content": system_prompt}]
-    if user_prompt:
-        messages.append({"role": "user", "content": user_prompt})
+    # Keep a non-empty user turn for local OpenAI-compatible chat backends.
+    # Some Ollama/Llama chat templates return an empty assistant message when
+    # prompted with only a system message.
+    messages.append({
+        "role": "user",
+        "content": user_prompt or (
+            "Please follow the instructions above and output the next response now."
+        ),
+    })
 
     completion = client.chat.completions.create(
         model=model,
@@ -43,6 +50,7 @@ def _query_openai_compatible_chat(
     )
     response = completion.choices[0].message.content or ""
     usage = completion.usage.model_dump() if completion.usage is not None else {}
+    usage["finish_reason"] = completion.choices[0].finish_reason
     return response, usage
 
 

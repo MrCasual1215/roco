@@ -28,8 +28,18 @@ def _query_openai_compatible_chat(
         api_key=os.environ.get("OPENAI_API_KEY", "ollama"),
     )
     messages = [{"role": "system", "content": system_prompt}]
-    if user_prompt:
-        messages.append({"role": "user", "content": user_prompt})
+    # Some OpenAI-compatible local chat backends (notably Ollama/Llama chat
+    # templates) may immediately emit an end-of-turn token when the request has
+    # only a system message.  SingleThreadPrompter used to pass user_prompt="",
+    # which caused empty responses such as completion_tokens=1 and no content.
+    # Always include a real user turn to trigger assistant generation.
+    messages.append({
+        "role": "user",
+        "content": user_prompt or (
+            "Please follow the instructions above and output the next plan now. "
+            "Use exactly the required EXECUTE/NAME/ACTION format."
+        ),
+    })
 
     completion = client.chat.completions.create(
         model=model,
@@ -39,6 +49,7 @@ def _query_openai_compatible_chat(
     )
     response = completion.choices[0].message.content or ""
     usage = completion.usage.model_dump() if completion.usage is not None else {}
+    usage["finish_reason"] = completion.choices[0].finish_reason
     return response, usage
 
 PATH_PLAN_INSTRUCTION="""
@@ -114,6 +125,7 @@ class SingleThreadPrompter:
 
         self.round_history = [] # [obs_t, action_t] but only if action_t got executed
         self.failed_plans = [] # could inherit from previous round if the final plan failed to execute in env.
+        self.unresolved_plan_feedbacks = [] # carry LLM parse/env feedback across runner steps if no plan was executable
         self.response_history = [] # [response_t]
         
 
@@ -121,6 +133,7 @@ class SingleThreadPrompter:
         state_dict = dict(
             round_history=self.round_history,
             failed_plans=self.failed_plans,
+            unresolved_plan_feedbacks=self.unresolved_plan_feedbacks,
         )
         save_path = os.path.join(save_path, fname)
         with open(save_path, "wb") as f:
@@ -132,6 +145,7 @@ class SingleThreadPrompter:
             state_dict = pickle.load(f)
         self.round_history = state_dict["round_history"]
         self.failed_plans = state_dict["failed_plans"]
+        self.unresolved_plan_feedbacks = state_dict.get("unresolved_plan_feedbacks", [])
 
     def compose_round_history(self):
         if len(self.round_history) == 0:
@@ -181,15 +195,58 @@ class SingleThreadPrompter:
 
         return full_prompt 
 
+    def compose_user_prompt(self):
+        agent_names = list(self.robot_agent_names)
+        agent_list = ", ".join(agent_names)
+        required_lines = "\n".join(
+            [f"NAME {agent_name} ACTION <one valid action>" for agent_name in agent_names]
+        )
+
+        if self.comm_mode == "plan":
+            return f"""
+You are the centralized planner for these robots: {agent_list}.
+Decide the best next action for every robot.
+
+Return ONLY the executable plan. Do not include analysis, markdown, or extra text.
+The response must have exactly this shape:
+EXECUTE
+{required_lines}
+
+Replace each '<one valid action>' with one valid action selected from [Action Options].
+Do not stop after EXECUTE; include exactly one NAME/ACTION line for each robot.
+Your response is:
+            """.strip()
+
+        if self.comm_mode == "chat":
+            return f"""
+You are the coordinator for these robots: {agent_list}.
+Use the instructions above to produce the final agreed plan.
+
+Return ONLY the final executable plan in this exact shape:
+EXECUTE
+{required_lines}
+
+Replace each '<one valid action>' with a valid action.
+Your response is:
+            """.strip()
+
+        return "Follow the instructions above and output the next response now."
+
     def prompt_one_round(self, obs: EnvState, save_path: str = ""): 
-        plan_feedbacks = []
+        # Start with feedback from a previous runner step that failed to produce
+        # any executable plan.  Without this, the next step sees an unchanged
+        # scene and repeats the same invalid proposal.
+        plan_feedbacks = list(self.unresolved_plan_feedbacks)
         response_history = []
         obs_desp = self.env.describe_obs(obs)
+        ready_to_execute = False
+        llm_plans = None
         for i in range(self.num_replans): 
             system_prompt = self.compose_system_prompt(obs_desp, plan_feedbacks)
+            user_prompt = self.compose_user_prompt()
             response, usage = self.query_once(
-                system_prompt, user_prompt=""
-                ) # NOTE: single_thread doesn't use user role
+                system_prompt, user_prompt=user_prompt
+                )
             response_history.append(response)
             
             timestamp = datetime.now().strftime("%m%d-%H%M")
@@ -200,7 +257,7 @@ class SingleThreadPrompter:
                     },
                     {
                         "sender": "UserPrompt",
-                        "message": "",
+                        "message": user_prompt,
                     },
                     {
                         "sender": "Planner",
@@ -221,7 +278,6 @@ Parsing failed! {parsed_str}
 Previous response: {execute_str}
 Re-format to strictly follow [Action Output Instruction]!
                 """
-                plan_feedbacks.append(curr_feedback)
                 ready_to_execute = False  
             # give env. feedback 
             else:
@@ -232,7 +288,8 @@ Re-format to strictly follow [Action Output Instruction]!
                         curr_feedback = env_feedback
                         break
             
-            plan_feedbacks.append(curr_feedback)
+            if curr_feedback != "None":
+                plan_feedbacks.append(curr_feedback)
             tosave = [
                 {
                     "sender": "Feedback",
@@ -251,6 +308,12 @@ Re-format to strictly follow [Action Output Instruction]!
                 plan_str = parsed_str
                 break  
         self.response_history = response_history
+        if ready_to_execute:
+            self.unresolved_plan_feedbacks = []
+        else:
+            # Keep only the latest few non-success feedback messages; this gives
+            # the next runner step continuity without making the prompt explode.
+            self.unresolved_plan_feedbacks = plan_feedbacks[-3:]
         return ready_to_execute, llm_plans, plan_feedbacks, response_history
 
 
@@ -293,6 +356,7 @@ Re-format to strictly follow [Action Output Instruction]!
         if execute_success: 
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
+            self.unresolved_plan_feedbacks = []
             responses = "\n".join(self.response_history)
             self.round_history.append(
                 f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
@@ -307,4 +371,5 @@ Re-format to strictly follow [Action Output Instruction]!
         # clear for next episode
         self.round_history = []
         self.failed_plans = [] 
+        self.unresolved_plan_feedbacks = []
         self.response_history = []
