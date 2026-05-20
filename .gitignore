@@ -4,3 +4,5 @@ output/
 data/
 *.zip
 ollama/ollama-linux-amd64.tar.zst
+models/
+matplotlibrc/
