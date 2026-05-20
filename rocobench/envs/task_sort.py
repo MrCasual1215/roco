@@ -58,13 +58,12 @@ Important Sort-specific rules:
 - Object target panels are fixed. Do not swap object goals between robots.
 - Fixed goals: blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
 - Each robot has a limited reach range; choose only actions listed in [Legal Actions].
-- If direct final placement is impossible, use a directed shared handoff panel.
-- Alice/Bob handoff uses panel3.
-- Bob/Chad handoff uses panel5.
-- A valid intermediate handoff is better than an invalid direct final placement.
+- Prefer actions that move an object closer to its fixed target. If direct final placement is impossible, use a reachable handoff panel.
+- Alice/Bob usually hand off through panel3; Bob/Chad usually hand off through panel5, but these are preferences, not object goals.
+- Avoid repeating an action that did not change the scene. If a cube is already on a shared handoff panel and the receiver can pick it, prefer the receiver's final placement over same-panel re-placement.
 - For reliability, use at most two non-WAIT actions per round.
-- Conservative parallelism rule: Alice and Chad may move in parallel when their actions are on opposite ends of the table; Bob must not move in parallel with another robot.
-- Prefer [Recommended Plan] unless feedback says it failed.
+- Parallel actions are best when their panel corridors do not overlap. If unsure, use one active robot and others WAIT.
+- Prefer [Recommended Plan] unless feedback says it failed, but all [Legal Actions] are valid candidates.
 - To reduce collision risk, use WAIT for robots that do not need to move.
 
 At each round, output exactly one ACTION per robot and strictly follow [Action Output Instruction].
@@ -74,8 +73,9 @@ Your final plan output is:
 SORTING_ACTION_SPACE="""
 [Action Options]
 1) PICK <object name> PLACE <location>
-2) WAIT
-Only PICK an object if your gripper is empty. Target <location> for PLACE should be panel or a bin.
+2) PLACE <object name> <location>: recovery action only if your gripper is already holding the object.
+3) WAIT
+Only PICK an object if your gripper is empty. If you are already holding a cube, use PLACE <object name> <location> to release it. Target <location> should be a panel.
 [Action Output Instruction]
 You must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
 Example: 'EXECUTE\nNAME Alice ACTION PICK red_square PLACE panel3\nNAME Bob ACTION WAIT\nNAME Chad ACTION PICK green_trapezoid PLACE panel6\n'
@@ -276,8 +276,23 @@ In the plan, at least one robot should be acting, you can't all WAIT.
         robot_name = self.robot_name_map_inv[agent_name]
         return self.check_reach_range(robot_name, target_pos)
 
+    def _agent_holding_cube(self, obs: EnvState, agent_name: str) -> Optional[str]:
+        robot_name = self.robot_name_map_inv[agent_name]
+        contacts = getattr(obs, robot_name).contacts
+        held_cubes = [c for c in contacts if c in self.cube_names]
+        return held_cubes[0] if len(held_cubes) > 0 else None
+
+    def _panel_occupancy(self, obs: EnvState) -> Dict[str, List[str]]:
+        occupancy: Dict[str, List[str]] = {}
+        for cube_name in self.cube_names:
+            if self.is_cube_done(obs, cube_name):
+                continue
+            panel_name = self.get_cube_panel(obs, cube_name)
+            occupancy.setdefault(panel_name, []).append(cube_name)
+        return occupancy
+
     def get_allowed_action_names(self) -> Set[str]:
-        return {"PICK", "WAIT"}
+        return {"PICK", "PLACE", "WAIT"}
 
     def get_max_parallel_actions(self, obs: Optional[EnvState] = None) -> int:
         """Allow limited safe parallelism for Sort.
@@ -290,11 +305,16 @@ In the plan, at least one robot should be acting, you can't all WAIT.
         return 2
 
     def _parse_sort_action(self, action: str) -> Tuple[Optional[str], Optional[str]]:
-        if "PICK" not in action or "PLACE" not in action:
-            return None, None
-        cube_name = action.split("PICK", 1)[1].split("PLACE", 1)[0].strip()
-        target_panel = action.split("PLACE", 1)[1].strip()
-        return cube_name, target_panel
+        if action.startswith("PICK ") and "PLACE" in action:
+            cube_name = action.split("PICK", 1)[1].split("PLACE", 1)[0].strip()
+            target_panel = action.split("PLACE", 1)[1].strip()
+            return cube_name, target_panel
+        if action.startswith("PLACE "):
+            parts = action.split("PLACE", 1)[1].strip().split()
+            if len(parts) < 2:
+                return None, None
+            return parts[0], parts[1]
+        return None, None
 
     def _panel_index(self, panel_name: Optional[str]) -> Optional[int]:
         if panel_name is None or not panel_name.startswith("panel"):
@@ -322,9 +342,6 @@ In the plan, at least one robot should be acting, you can't all WAIT.
             return True, "OK"
         if len(active) > 2:
             return False, "Sort allows at most two active robots."
-        agents = {agent for agent, _ in active}
-        if agents != {"Alice", "Chad"}:
-            return False, "Only Alice and Chad may move in parallel; Bob must be serial."
 
         parsed = [(agent, *self._parse_sort_action(action), action) for agent, action in active]
         cubes = [cube for _, cube, _, _ in parsed]
@@ -338,23 +355,52 @@ In the plan, at least one robot should be acting, you can't all WAIT.
             agent: self._sort_action_footprint(obs, action)
             for agent, action in active
         }
-        if not footprints["Alice"].isdisjoint(footprints["Chad"]):
-            return False, f"Parallel action footprints overlap: {footprints}"
+        active_agents = list(footprints.keys())
+        for i, agent_i in enumerate(active_agents):
+            for agent_j in active_agents[i + 1:]:
+                if not footprints[agent_i].isdisjoint(footprints[agent_j]):
+                    return False, f"Parallel action footprints overlap: {footprints}"
 
-        # Keep both shared handoff panels from being used in one parallel step;
-        # this avoids stretching the middle workspace and makes Bob's next step
-        # easier to plan.
+        return True, "OK"
+
+    def _sort_plan_risk(self, obs: EnvState, active: List[Tuple[str, str]]) -> Tuple[int, List[str]]:
+        """Soft risk model for ranking, not a broad hard constraint.
+
+        The older Sort policy encoded many route/parallel restrictions as hard
+        legality checks.  That helped some seeds but reduced generalization.
+        Here we keep only obvious collision/duplicate conflicts as hard checks
+        and use this score to prefer safer plans while still leaving alternative
+        legal actions available to the LLM/verifier.
+        """
+        risk = 0
+        notes: List[str] = []
+        if len(active) <= 1:
+            return risk, notes
+        footprints = {
+            agent: self._sort_action_footprint(obs, action)
+            for agent, action in active
+        }
+        agents = [agent for agent, _ in active]
+        if "Bob" in agents:
+            risk += 25
+            notes.append("Bob is the middle robot; parallel Bob motion is possible but riskier.")
         shared_panels = {3, 5}
         touched_shared = {
             agent: fp.intersection(shared_panels)
             for agent, fp in footprints.items()
         }
-        if touched_shared["Alice"] and touched_shared["Chad"]:
-            return False, f"Both parallel actions touch shared handoff panels: {touched_shared}"
-        return True, "OK"
+        if sum(1 for touched in touched_shared.values() if touched) >= 2:
+            risk += 35
+            notes.append("Multiple robots touch shared handoff panels in the same round.")
+        return risk, notes
 
     def verify_plan_semantics(self, obs: EnvState, actions: Dict[str, str]) -> Tuple[bool, str]:
-        """Task-specific verification hook used by the generic plan verifier."""
+        """Task-specific hard validation hook.
+
+        This intentionally checks only hard constraints.  Route preference,
+        Bob-serial preference, and handoff-panel occupancy are handled by
+        scoring/recommendation, not by rejecting otherwise physical candidates.
+        """
         if set(actions.keys()) != set(self.robots.keys()):
             return False, f"Expected actions for {list(self.robots.keys())}, got {list(actions.keys())}"
 
@@ -372,19 +418,20 @@ In the plan, at least one robot should be acting, you can't all WAIT.
                 return False, f"{agent_name} action '{action}' is not in current legal actions."
             if action == "WAIT":
                 continue
-            if "PICK" not in action or "PLACE" not in action:
-                return False, f"{agent_name} action must be PICK <cube> PLACE <panel> or WAIT."
+            held_cube = self._agent_holding_cube(obs, agent_name)
+            if not (action.startswith("PICK ") or action.startswith("PLACE ")):
+                return False, f"{agent_name} action must be PICK <cube> PLACE <panel>, PLACE <cube> <panel>, or WAIT."
             cube_name, target_panel = self._parse_sort_action(action)
             if cube_name not in self.cube_names:
                 return False, f"Unknown cube {cube_name}."
-            if self.is_cube_done(obs, cube_name):
+            if action.startswith("PICK ") and held_cube is not None:
+                return False, f"{agent_name} is already holding {held_cube} and cannot PICK."
+            if action.startswith("PLACE ") and held_cube != cube_name:
+                return False, f"{agent_name} holds {held_cube}, but tried to PLACE {cube_name}."
+            if self.is_cube_done(obs, cube_name) and not action.startswith("PLACE "):
                 return False, f"{cube_name} is already done and should not be moved."
-            allowed_targets = self._sort_route_targets(obs, agent_name, cube_name)
-            if target_panel not in allowed_targets:
-                return False, (
-                    f"{agent_name} cannot move {cube_name} to {target_panel}; "
-                    f"directed route targets are {allowed_targets}."
-                )
+            if not self.can_agent_place_panel(agent_name, target_panel):
+                return False, f"{agent_name} cannot place to {target_panel}."
         return True, "OK"
 
     def _sort_route_targets(self, obs: EnvState, agent_name: str, cube_name: str) -> List[str]:
@@ -428,20 +475,29 @@ In the plan, at least one robot should be acting, you can't all WAIT.
         return route.get(agent_name, [])
 
     def get_legal_actions(self, obs: EnvState) -> Dict[str, List[str]]:
-        """Return executable high-level action candidates for the current sort state.
+        """Return broad physically-plausible high-level action candidates.
 
-        The centralized LLM planner should choose from this list instead of
-        inventing free-form actions.  Candidates are intentionally conservative:
-        completed cubes are not moved, and each cube follows a directed handoff
-        route toward its fixed target panel.
+        Legal actions are no longer the same as the preferred route.  A legal
+        PICK/PLACE must satisfy current gripper state and reachability; the
+        recommender below scores whether it is good progress toward the goal.
+        This keeps code2's LLM/verifier pipeline flexible while still preventing
+        clearly impossible actions.
         """
         legal_actions = {agent_name: ["WAIT"] for agent_name in self.robots.keys()}
         for agent_name in self.robots.keys():
+            held_cube = self._agent_holding_cube(obs, agent_name)
+            if held_cube is not None:
+                for panel_name in self.reachable_panels[agent_name]:
+                    if self.can_agent_place_panel(agent_name, panel_name):
+                        legal_actions[agent_name].append(f"PLACE {held_cube} {panel_name}")
+                continue
             for cube_name in self.cube_names:
+                if self.is_cube_done(obs, cube_name):
+                    continue
                 if not self.can_agent_reach_cube(obs, agent_name, cube_name):
                     continue
                 current_panel = self.get_cube_panel(obs, cube_name)
-                for panel_name in self._sort_route_targets(obs, agent_name, cube_name):
+                for panel_name in self.reachable_panels[agent_name]:
                     if panel_name == current_panel:
                         continue
                     if not self.can_agent_place_panel(agent_name, panel_name):
@@ -449,56 +505,100 @@ In the plan, at least one robot should be acting, you can't all WAIT.
                     legal_actions[agent_name].append(f"PICK {cube_name} PLACE {panel_name}")
         return legal_actions
 
+    def _action_progress(self, obs: EnvState, cube_name: str, target_panel: str) -> int:
+        current_panel = self.get_cube_panel(obs, cube_name)
+        current_idx = self._panel_index(current_panel)
+        target_idx = self._panel_index(self.cube_to_bin[cube_name])
+        next_idx = self._panel_index(target_panel)
+        if current_idx is None or target_idx is None or next_idx is None:
+            return 0
+        return abs(current_idx - target_idx) - abs(next_idx - target_idx)
+
+    def _score_sort_action(self, obs: EnvState, agent_name: str, action: str) -> int:
+        if action == "WAIT":
+            return 0
+        cube_name, target_panel = self._parse_sort_action(action)
+        if cube_name is None or target_panel is None:
+            return -1000
+
+        score = 0
+        final_panel = self.cube_to_bin[cube_name]
+        progress = self._action_progress(obs, cube_name, target_panel)
+        current_panel = self.get_cube_panel(obs, cube_name)
+
+        if target_panel == final_panel:
+            score += 120
+        score += 35 * progress
+
+        preferred_targets = self._sort_route_targets(obs, agent_name, cube_name)
+        if target_panel in preferred_targets:
+            score += 25
+
+        if target_panel == current_panel:
+            # Same-panel replacement is a recovery tool, not a normal routing
+            # action.  Keep it available only through explicit PLACE recovery or
+            # if legal generation later adds it, but do not recommend it by
+            # default over true progress.
+            score -= 60
+
+        occupancy = self._panel_occupancy(obs)
+        if target_panel in occupancy and cube_name not in occupancy[target_panel]:
+            score -= 45
+
+        if action.startswith("PLACE "):
+            score += 30
+
+        # Small deterministic tie-breakers that prefer clearing outer objects
+        # without hard-coding route legality.
+        priority = {
+            "yellow_trapezoid": 3,
+            "blue_square": 2,
+            "pink_polygon": 1,
+        }.get(cube_name, 0)
+        score += priority
+        return score
+
     def get_recommended_plan(self, obs: EnvState) -> Dict[str, str]:
-        """Greedy safe plan used as a strong hint and fallback for plan mode."""
+        """Score legal candidates and recommend the best low-risk combination."""
         legal_actions = self.get_legal_actions(obs)
         plan = {agent_name: "WAIT" for agent_name in self.robots.keys()}
-        used_agents = set()
-        used_cubes = set()
-        used_targets = set()
-
-        def action_score(agent_name: str, action: str) -> Tuple[int, int]:
-            if action == "WAIT":
-                return (0, 0)
-            cube_name = action.split("PICK", 1)[1].split("PLACE", 1)[0].strip()
-            target_panel = action.split("PLACE", 1)[1].strip()
-            final_panel = self.cube_to_bin[cube_name]
-            final_bonus = 100 if target_panel == final_panel else 50
-            # Prefer resolving right-side final object before moving unrelated handoffs.
-            priority = {
-                "yellow_trapezoid": 3,
-                "blue_square": 2,
-                "pink_polygon": 1,
-            }.get(cube_name, 0)
-            return (final_bonus, priority)
 
         candidates = []
         for agent_name, actions in legal_actions.items():
             for action in actions:
                 if action == "WAIT":
                     continue
-                cube_name = action.split("PICK", 1)[1].split("PLACE", 1)[0].strip()
-                candidates.append((action_score(agent_name, action), agent_name, cube_name, action))
+                cube_name, target_panel = self._parse_sort_action(action)
+                score = self._score_sort_action(obs, agent_name, action)
+                candidates.append((score, agent_name, cube_name, target_panel, action))
 
-        # Recommend limited safe parallelism: keep Bob serial, but allow
-        # compatible Alice+Chad opposite-end actions when their panel
-        # footprints do not overlap.
-        for _, agent_name, cube_name, action in sorted(candidates, reverse=True):
-            target_panel = action.split("PLACE", 1)[1].strip()
-            if agent_name in used_agents or cube_name in used_cubes or target_panel in used_targets:
-                continue
-            candidate_active = [
-                (agent, act) for agent, act in plan.items() if act != "WAIT"
-            ] + [(agent_name, action)]
-            compatible, _ = self._sort_parallel_compatible(obs, candidate_active)
-            if not compatible:
-                continue
+        from itertools import combinations
+        best_combo: Tuple[Tuple[int, str, str, str, str], ...] = ()
+        best_score = -10**9
+        max_parallel = min(self.get_max_parallel_actions(obs), len(candidates))
+        for size in range(1, max_parallel + 1):
+            for combo in combinations(candidates, size):
+                agents = [agent for _, agent, _, _, _ in combo]
+                cubes = [cube for _, _, cube, _, _ in combo]
+                targets = [target for _, _, _, target, _ in combo]
+                if len(set(agents)) != len(agents):
+                    continue
+                if len(set(cubes)) != len(cubes):
+                    continue
+                if len(set(targets)) != len(targets):
+                    continue
+                active = [(agent, action) for _, agent, _, _, action in combo]
+                compatible, _ = self._sort_parallel_compatible(obs, active)
+                if not compatible:
+                    continue
+                risk, _ = self._sort_plan_risk(obs, active)
+                score = sum(s for s, _, _, _, _ in combo) - risk + 5 * size
+                if score > best_score:
+                    best_score = score
+                    best_combo = combo
+
+        for _, agent_name, _, _, action in best_combo:
             plan[agent_name] = action
-            used_agents.add(agent_name)
-            used_cubes.add(cube_name)
-            used_targets.add(target_panel)
-            if len(used_agents) >= self.get_max_parallel_actions(obs):
-                break
         return plan
 
     def format_legal_actions_prompt(self, obs: EnvState) -> str:
@@ -508,7 +608,8 @@ In the plan, at least one robot should be acting, you can't all WAIT.
             "[Legal Actions]",
             "You must choose exactly one listed action for each robot. Do not invent actions.",
             f"For this task, choose at most {self.get_max_parallel_actions(obs)} non-WAIT actions per round.",
-            "Parallel actions are allowed only for compatible Alice+Chad opposite-end moves; Bob must be serial.",
+            "Parallel actions are allowed when their panel corridors do not overlap; Bob-parallel motions are riskier but not always forbidden.",
+            "Actions marked recommended are high-scoring soft preferences, not the only valid actions.",
         ]
         for agent_name, actions in legal_actions.items():
             lines.append(f"{agent_name}:")
@@ -782,19 +883,17 @@ In the plan, at least one robot should be acting, you can't all WAIT.
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
         for agent_name, action_str in llm_plan.action_strs.items():
-            if ('PICK' in action_str and 'PLACE' not in action_str) or \
-                ('PLACE' in action_str and 'PICK' not in action_str):
-                    feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
-            if 'PICK' in action_str and 'PLACE' in action_str:
-                obj = action_str.split('PICK')[1].split('PLACE')[0].strip()
-                target = action_str.split('PLACE')[1].strip()
-                if obj in self.cube_names and target in self.cube_to_bin.values():
-                    correct_panel = self.cube_to_bin[obj]
-                    if correct_panel not in target:
-                        valid_panels = ", ".join(
-                            [correct_panel, 'panel3', 'panel5']
-                        )
-                        feedback += f"{agent_name}'s ACTION is not valid, {obj} cube can only be placed on {valid_panels}, but not on {target}"
+            if action_str == "WAIT":
+                continue
+            if not (action_str.startswith("PICK ") or action_str.startswith("PLACE ")):
+                feedback += f"{agent_name}'s ACTION must be PICK <cube> PLACE <panel>, PLACE <cube> <panel>, or WAIT.\n"
+                continue
+            obj, target = self._parse_sort_action(action_str)
+            if obj not in self.cube_names:
+                feedback += f"{agent_name}'s ACTION uses unknown cube {obj}.\n"
+                continue
+            if target is None or not str(target).startswith("panel"):
+                feedback += f"{agent_name}'s ACTION must place {obj} onto a panel target.\n"
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
             feedback += f"You can't all WAIT. The task is not complete, at least one robot should be acting."
         return feedback 

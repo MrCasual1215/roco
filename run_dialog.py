@@ -243,7 +243,15 @@ class LLMRunner:
 
                 if not self.skip_display:
                     for i, plan in enumerate(current_llm_plan):
-                        self.display_plan(plan, save_name=f"vis_llm_plan_{i}", save_dir=step_dir)
+                        try:
+                            self.display_plan(plan, save_name=f"vis_llm_plan_{i}", save_dir=step_dir)
+                        except Exception as exc:
+                            # Visualization is optional and can fail on
+                            # headless machines without a working Open3D/GLX
+                            # context.  Do not mark an otherwise valid plan as
+                            # failed just because a debug image could not be
+                            # rendered.
+                            print(f"[Warning] display_plan failed and was skipped: {type(exc).__name__}: {exc}")
 
 
                 if not self.light_output:
@@ -501,6 +509,11 @@ def main(args):
         args.direct_waypoints = 0
         logging.warning("PackGroceryTask requires split parsed plans, and no failed waypoints, no direct waypoints\n")
 
+    if args.timestamp_run_name:
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.run_name = f"{args.run_name}_{run_timestamp}"
+        print(f"[run_dialog] timestamped run_name: {args.run_name}")
+
     render_freq = 600
     if args.control_freq == 15:
         render_freq = 1200
@@ -593,6 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
     parser.add_argument("--light_output", action="store_true", help="Save only final per-run result JSON and a small summary HTML; skip prompt logs, pickles, images, and videos.")
+    parser.add_argument("--timestamp_run_name", action="store_true", help="Append YYYYMMDD_HHMMSS to --run_name so each test writes to a fresh directory.")
     logging.basicConfig(level=logging.INFO)
 
     args = parser.parse_args()
