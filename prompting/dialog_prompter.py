@@ -289,14 +289,11 @@ EXECUTE
                 save_path=save_path,
             )
             chat_history += agent_responses
-            candidate_response = final_response
-            final_response = self.verify_output_plan(
-                obs=obs,
-                candidate_response=candidate_response,
-                feedback_history=plan_feedbacks,
-                save_path=save_path,
-                replan_idx=i,
-            )
+            # Do not run the extra LLM output verifier in dialog mode.
+            # The verifier has been observed to "correct" valid SweepTask
+            # plans such as `Alice WAIT / Bob SWEEP cube` into repeated
+            # `MOVE cube` plans, causing no-progress failures.  Parser and
+            # environment feedback remain the hard validation layers below.
             parse_succ, parsed_str, llm_plans = self.parser.parse(obs, final_response) 
 
             curr_feedback = "None"

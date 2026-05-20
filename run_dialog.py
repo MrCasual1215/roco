@@ -152,6 +152,9 @@ class LLMRunner:
         self.policy_kwargs = policy_kwargs
         self.video_format = video_format
         self.light_output = light_output
+        self.no_progress_repeat_threshold = int(
+            os.environ.get("ROCO_NO_PROGRESS_REPEAT_THRESHOLD", "2")
+        )
         # light_output is intended for quota-limited filesystems: avoid images,
         # videos, prompt JSONs, and large/intermediate pickle files.
         self.skip_display = skip_display or light_output
@@ -209,6 +212,90 @@ class LLMRunner:
             )
 
 
+    def _tracked_cube_state_signature(self, obs):
+        """Return a compact, stable signature for cube progress detection.
+
+        For SweepTask a necessary MOVE usually changes robot state but not cube
+        state.  We therefore only mark a plan after the *same* no-cube-change
+        plan repeats consecutively.  Positions are rounded to ignore tiny
+        physics jitter while still catching meaningful cube movement.
+        """
+        object_names = []
+        if hasattr(self.env, "cube_names"):
+            object_names = list(getattr(self.env, "cube_names"))
+        else:
+            object_names = [name for name in obs.objects.keys() if "cube" in name]
+        object_names = [name for name in object_names if name in obs.objects]
+        if len(object_names) == 0:
+            return None
+
+        signature = []
+        for name in sorted(object_names):
+            obj = obs.objects[name]
+            contacts = set(getattr(obj, "contacts", set()))
+            if "trash_bin_bottom" in contacts:
+                support = "trash_bin"
+            elif "dustpan_bottom" in contacts:
+                support = "dustpan"
+            elif "table" in contacts:
+                support = "table"
+            else:
+                support = ",".join(sorted(contacts))
+            pos = tuple(np.round(np.asarray(obj.xpos, dtype=float), 2))
+            signature.append((name, support, pos))
+        return tuple(signature)
+
+    def _normalize_plan_signature(self, llm_plan) -> str:
+        if llm_plan is None:
+            return ""
+        proposal = getattr(llm_plan, "parsed_proposal", "") or ""
+        lines = []
+        for line in proposal.splitlines():
+            line = line.strip()
+            if line.startswith("NAME ") and " ACTION " in line:
+                lines.append(line)
+        if not lines and hasattr(llm_plan, "action_strs"):
+            agent_order = getattr(llm_plan, "agent_names", list(llm_plan.action_strs.keys()))
+            lines = [
+                f"NAME {agent_name} ACTION {llm_plan.action_strs[agent_name]}"
+                for agent_name in agent_order
+                if agent_name in llm_plan.action_strs
+            ]
+        return "\n".join(lines)
+
+    def _add_unique_limited(self, items, item: str, limit: int = 12):
+        item = item.strip()
+        if not item:
+            return
+        if item in items:
+            return
+        items.append(item)
+        del items[:-limit]
+
+    def _record_no_progress_plan(self, plan_signature: str, repeat_count: int):
+        reason = (
+            f"[No-progress detected] The same plan repeated at least "
+            f"{self.no_progress_repeat_threshold} consecutive times while "
+            "tracked cube positions/contacts did not change. Do NOT repeat this "
+            "plan; choose an action that changes cube state, e.g. SWEEP if both "
+            "robots are aligned or DUMP if cubes are in the dustpan."
+        )
+        failed_entry = f"{reason}\n{plan_signature}"
+
+        if hasattr(self.prompter, "failed_plans"):
+            self._add_unique_limited(self.prompter.failed_plans, failed_entry, limit=12)
+
+        # SingleThreadPrompter has an explicit prompt blacklist; DialogPrompter
+        # currently only uses failed_plans, so this is intentionally optional.
+        if hasattr(self.prompter, "failed_plan_blacklist"):
+            self._add_unique_limited(
+                self.prompter.failed_plan_blacklist,
+                plan_signature,
+                limit=12,
+            )
+        return failed_entry
+
+
     def display_plan(self, plan: LLMPathPlan, save_name = "vis_plan", save_dir = None):
         """ Display the plan in the open3d viewer """ 
         env = deepcopy(self.env)
@@ -245,6 +332,8 @@ class LLMRunner:
         reward = 0
         obs = env.get_obs()
         timed_out = False
+        last_no_progress_plan = None
+        no_progress_repeat_count = 0
         
         for step in range(start_step, start_step + self.max_runner_steps):
             # Check if timeout exceeded
@@ -268,6 +357,7 @@ class LLMRunner:
                 with open(data_fname, "wb") as f:
                     pickle.dump(sim_data, f)
 
+            cube_sig_before = self._tracked_cube_state_signature(obs)
 
             if step == start_step and len(prev_llm_plans) > 0:
                 ready_to_execute = 1
@@ -373,11 +463,46 @@ class LLMRunner:
                 with open(data_fname, "wb") as f:
                     pickle.dump(sim_data, f)
 
-            self.prompter.post_execute_update(
-                obs_desp="", # TODO
-                execute_success=(not rewind_env),
-                parsed_plan=current_llm_plan[0].get_action_desp()
+            parsed_plan = current_llm_plan[0].get_action_desp()
+            plan_signature = self._normalize_plan_signature(current_llm_plan[0])
+            cube_sig_after = self._tracked_cube_state_signature(obs)
+            no_cube_progress = (
+                not rewind_env
+                and cube_sig_before is not None
+                and cube_sig_after is not None
+                and cube_sig_before == cube_sig_after
+                and bool(plan_signature)
             )
+
+            if no_cube_progress and plan_signature == last_no_progress_plan:
+                no_progress_repeat_count += 1
+            elif no_cube_progress:
+                last_no_progress_plan = plan_signature
+                no_progress_repeat_count = 1
+            else:
+                last_no_progress_plan = None
+                no_progress_repeat_count = 0
+
+            repeated_no_progress = (
+                self.no_progress_repeat_threshold > 0
+                and no_progress_repeat_count >= self.no_progress_repeat_threshold
+            )
+
+            if repeated_no_progress:
+                parsed_plan = self._record_no_progress_plan(
+                    plan_signature,
+                    no_progress_repeat_count,
+                )
+                print(
+                    f"Run {run_id}: Step {step} detected repeated no-progress "
+                    f"plan ({no_progress_repeat_count}x); added to failed/blacklist."
+                )
+            else:
+                self.prompter.post_execute_update(
+                    obs_desp="", # TODO
+                    execute_success=(not rewind_env),
+                    parsed_plan=parsed_plan,
+                )
 
             if done:
                 break
