@@ -19,7 +19,7 @@ DEFAULT_RUN_TIMEOUTS = {
 
 # Default communication mode settings for each task, can be customized per task
 DEFAULT_COMM_MODES = {
-    "sort": "dialog",
+    "sort": "plan",
     "cabinet": "plan",
     "rope": "plan",
     "sweep": "dialog",
@@ -27,7 +27,16 @@ DEFAULT_COMM_MODES = {
     "pack": "plan",
 }
 
-def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, run_timeout: float = None, comm_mode: str = None):
+def test_run_dialog(
+    task: str,
+    num_runs: int,
+    output_dir: str,
+    seed: int = 0,
+    run_timeout: float = None,
+    comm_mode: str = None,
+    llm_source: str = None,
+    light_output: bool = False,
+):
     """
     Test and run dialog tasks
     
@@ -38,6 +47,8 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
         seed: Random seed
         run_timeout: Timeout for single run (seconds). If None, use value from DEFAULT_RUN_TIMEOUTS, default 60s
         comm_mode: Communication mode. If None, use value from DEFAULT_COMM_MODES, default "chat"
+        llm_source: Model name passed to run_dialog.py --llm_source. If None, use run_dialog.py default
+        light_output: If True, pass --light_output to run_dialog.py to save only minimal artifacts
     """
     # If timeout not specified, use task default or global default of 60s
     if run_timeout is None:
@@ -47,7 +58,8 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
         comm_mode = DEFAULT_COMM_MODES.get(task, "chat")
     
     print("\n" + Colors.CYAN + Colors.BOLD + f"▶ Starting Task: {task.upper()}" + Colors.ENDC)
-    print(Colors.CYAN + f"  Configuration: {num_runs} runs, {run_timeout}s timeout per run, comm_mode={comm_mode}" + Colors.ENDC)
+    model_text = llm_source if llm_source is not None else "run_dialog.py default"
+    print(Colors.CYAN + f"  Configuration: {num_runs} runs, {run_timeout}s timeout per run, comm_mode={comm_mode}, llm_source={model_text}, light_output={light_output}" + Colors.ENDC)
     
     task_log_dir = next_task_log_dir(task)
     if task_log_dir is not None:
@@ -85,6 +97,10 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
                '--seed', str(seed),
                '--comm_mode', comm_mode,
                '--run_timeout', str(run_timeout)]  # Pass run timeout parameter
+    if llm_source is not None:
+        command.extend(['--llm_source', llm_source])
+    if light_output:
+        command.append('--light_output')
 
     subprocess_started_at = datetime.now()
     try:
@@ -204,6 +220,8 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
         'total_time': total_time,
         'returncode': result.returncode,
         'comm_mode': comm_mode,
+        'llm_source': llm_source,
+        'light_output': light_output,
         'run_ids': current_run_ids,
     }
     if task_log_dir is not None:
@@ -217,7 +235,15 @@ def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, ru
     return summary
 
 if __name__ == "__main__":
+    import argparse
     import time as time_module
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--llm_source", "-llm", type=str, default=None,
+                        help="Model name passed to run_dialog.py --llm_source, e.g. gpt-oss:20b. If omitted, use run_dialog.py default.")
+    parser.add_argument("--light_output", action="store_true",
+                        help="Enable lightweight evaluation artifacts by passing --light_output to run_dialog.py. Default is full/original output.")
+    args = parser.parse_args()
 
     with terminal_log():
         # tasks = ["sort", "cabinet", "rope", "sweep", "sandwich", "pack"]
@@ -226,15 +252,15 @@ if __name__ == "__main__":
 
         results = []
         
-        num_runs = 1
+        num_runs = 5 
 
         # Use default timeout (from DEFAULT_RUN_TIMEOUTS)
-        results.append(test_run_dialog("sort", num_runs, "output"))
-        results.append(test_run_dialog("cabinet", num_runs, "output"))
-        results.append(test_run_dialog("rope", num_runs, "output"))
-        results.append(test_run_dialog("sweep", num_runs, "output"))
-        results.append(test_run_dialog("sandwich", num_runs, "output"))
-        results.append(test_run_dialog("pack", num_runs, "output"))
+        results.append(test_run_dialog("sort", num_runs, "output", llm_source=args.llm_source, light_output=args.light_output))
+        results.append(test_run_dialog("cabinet", num_runs, "output", llm_source=args.llm_source, light_output=args.light_output))
+        results.append(test_run_dialog("rope", num_runs, "output", llm_source=args.llm_source, light_output=args.light_output))
+        results.append(test_run_dialog("sweep", num_runs, "output", llm_source=args.llm_source, light_output=args.light_output))
+        results.append(test_run_dialog("sandwich", num_runs, "output", llm_source=args.llm_source, light_output=args.light_output))
+        results.append(test_run_dialog("pack", num_runs, "output", llm_source=args.llm_source, light_output=args.light_output))
 
         end_time = time_module.time()
         total_elapsed = end_time - begin_time

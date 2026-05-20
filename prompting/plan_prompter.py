@@ -9,6 +9,7 @@ import openai
 from datetime import datetime
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
+from .llm_client import query_ollama_chat
 from typing import List, Tuple, Dict, Union, Optional, Any
 
 def _query_openai_compatible_chat(
@@ -161,6 +162,10 @@ class SingleThreadPrompter:
     def _is_pack_task(self) -> bool:
         """Use extra verifier only for the PackGrocery task."""
         return self.env.__class__.__name__ == "PackGroceryTask"
+
+    def _is_sort_task(self) -> bool:
+        """Use the public-code Sort pipeline only for SortOneBlockTask."""
+        return self.env.__class__.__name__ == "SortOneBlockTask"
 
     def _add_unique_limited(self, items: List[str], item: str, limit: int = 20):
         item = item.strip()
@@ -329,8 +334,9 @@ EXECUTE
             },
             usage,
         ]
-        fname = f'{save_path}/replan{replan_idx}_verifier_{timestamp}.json'
-        json.dump(tosave, open(fname, 'w'))
+        if save_path:
+            fname = f'{save_path}/replan{replan_idx}_verifier_{timestamp}.json'
+            json.dump(tosave, open(fname, 'w'))
 
         # Keep a malformed verifier from destroying an otherwise parseable plan;
         # the normal parser+feedback path will still reject invalid candidates.
@@ -432,8 +438,9 @@ EXECUTE
             },
             usage,
         ]
-        fname = f'{save_path}/replan{replan_idx}_pack_verifier_{timestamp}.json'
-        json.dump(tosave, open(fname, 'w'))
+        if save_path:
+            fname = f'{save_path}/replan{replan_idx}_pack_verifier_{timestamp}.json'
+            json.dump(tosave, open(fname, 'w'))
 
         # Keep a malformed verifier from destroying an otherwise parseable plan;
         # the normal parser+feedback path will still reject invalid candidates.
@@ -449,11 +456,267 @@ EXECUTE
             ret += f"== Round#{i} ==\n{history}"
         ret += f"== Current Round ==\n"
         return ret
+
+    # ---- Sort-only public deployment pipeline helpers ----
+    # These mirror the public Sort pipeline but are gated by _is_sort_task() so
+    # Cabinet/Rope/Sweep/Sandwich/Pack keep their existing deployment flows.
+
+    def _sort_format_legal_actions_prompt(self, obs: EnvState) -> str:
+        if self._is_sort_task() and hasattr(self.env, "format_legal_actions_prompt"):
+            return self.env.format_legal_actions_prompt(obs)
+        return ""
+
+    def _sort_get_legal_actions(self, obs: EnvState) -> Dict[str, List[str]]:
+        if self._is_sort_task() and hasattr(self.env, "get_legal_actions"):
+            return self.env.get_legal_actions(obs)
+        return {}
+
+    def _sort_get_recommended_response(self, obs: EnvState) -> Optional[str]:
+        if not (self._is_sort_task() and hasattr(self.env, "get_recommended_plan")):
+            return None
+        plan = self.env.get_recommended_plan(obs)
+        if not plan:
+            return None
+        lines = ["EXECUTE"]
+        for agent_name in self.robot_agent_names:
+            if agent_name not in plan:
+                return None
+            lines.append(f"NAME {agent_name} ACTION {plan[agent_name]}")
+        return "\n".join(lines)
+
+    def _response_from_actions(self, actions: Dict[str, str]) -> str:
+        lines = ["EXECUTE"]
+        for agent_name in self.robot_agent_names:
+            lines.append(f"NAME {agent_name} ACTION {actions.get(agent_name, 'WAIT')}")
+        return "\n".join(lines)
+
+    def _extract_action_lines(self, response: str) -> Dict[str, str]:
+        if not response or "EXECUTE" not in response:
+            return {}
+        execute_str = response.split("EXECUTE", 1)[1]
+        actions = {}
+        for raw_line in execute_str.splitlines():
+            line = raw_line.strip()
+            if not line or "NAME" not in line or "ACTION" not in line:
+                continue
+            agent_name = line.split("NAME", 1)[1].split("ACTION", 1)[0].strip()
+            action = line.split("ACTION", 1)[1].strip()
+            actions[agent_name] = action
+        return actions
+
+    def _sort_validate_against_legal_actions(
+        self,
+        obs: EnvState,
+        response: str,
+        legal_actions: Dict[str, List[str]],
+        forbidden_actions: Dict[str, set],
+    ) -> Tuple[bool, str]:
+        """Public-code validation layer, enabled only for SortOneBlockTask."""
+        actions = self._extract_action_lines(response)
+        expected_agents = list(self.robot_agent_names)
+        missing = [agent for agent in expected_agents if agent not in actions]
+        extra = [agent for agent in actions if agent not in expected_agents]
+        if missing or extra:
+            return False, f"Plan must contain exactly one action for each robot. missing={missing}, extra={extra}"
+
+        allowed_action_names = None
+        if hasattr(self.env, "get_allowed_action_names"):
+            allowed_action_names = set(self.env.get_allowed_action_names())
+
+        picked_objects = []
+        placed_targets = []
+        active_actions = []
+        for agent_name, action in actions.items():
+            first_token = action.split()[0] if action.split() else ""
+            if allowed_action_names is not None and first_token not in allowed_action_names:
+                return False, (
+                    f"Invalid action name for {agent_name}: '{first_token}'. "
+                    f"Allowed action names: {sorted(allowed_action_names)}"
+                )
+
+            legal_for_agent = legal_actions.get(agent_name, []) if legal_actions else []
+            if legal_actions and action not in legal_for_agent:
+                return False, (
+                    f"Illegal action for {agent_name}: '{action}'. "
+                    f"Choose one of: {legal_for_agent}"
+                )
+            if action in forbidden_actions.get(agent_name, set()):
+                return False, f"Action for {agent_name} repeats a failed action this round: '{action}'"
+            if action != "WAIT":
+                active_actions.append((agent_name, action))
+            if "PICK" in action and "PLACE" in action:
+                obj = action.split("PICK", 1)[1].split("PLACE", 1)[0].strip()
+                target = action.split("PLACE", 1)[1].strip()
+                picked_objects.append(obj)
+                placed_targets.append(target)
+
+        max_parallel_actions = None
+        if hasattr(self.env, "get_max_parallel_actions"):
+            try:
+                max_parallel_actions = self.env.get_max_parallel_actions(obs)
+            except TypeError:
+                max_parallel_actions = self.env.get_max_parallel_actions()
+        if max_parallel_actions is not None and len(active_actions) > max_parallel_actions:
+            return False, (
+                f"Too many non-WAIT actions: {len(active_actions)}. "
+                f"This task allows at most {max_parallel_actions} non-WAIT action(s) per round. "
+                f"Active actions: {active_actions}. Use WAIT for the other robots."
+            )
+
+        duplicate_objects = sorted({obj for obj in picked_objects if picked_objects.count(obj) > 1})
+        if duplicate_objects:
+            return False, f"Multiple robots cannot PICK the same object in one round: {duplicate_objects}"
+        duplicate_targets = sorted({target for target in placed_targets if placed_targets.count(target) > 1})
+        if duplicate_targets:
+            return False, f"Multiple robots should not PLACE into the same target in one round: {duplicate_targets}"
+
+        if hasattr(self.env, "verify_plan_semantics"):
+            valid, reason = self.env.verify_plan_semantics(obs, actions)
+            if not valid:
+                return False, f"Task semantic verification failed: {reason}"
+        return True, "OK"
+
+    def _extract_agents_from_text(self, text: str) -> List[str]:
+        failed_agents = []
+        if not text:
+            return failed_agents
+        for agent_name in self.robot_agent_names:
+            patterns = [
+                f"Action for {agent_name}",
+                f"Illegal action for {agent_name}",
+                f"{agent_name}'s ACTION",
+                f"Out of reach: {agent_name}",
+                f"IK failed: on {agent_name}",
+            ]
+            if any(pattern in text for pattern in patterns):
+                failed_agents.append(agent_name)
+        return failed_agents
+
+    def _ban_actions_from_response(
+        self,
+        response: str,
+        forbidden_actions: Dict[str, set],
+        agents: Optional[List[str]] = None,
+    ) -> None:
+        agents_to_ban = set(agents) if agents else None
+        for agent_name, action in self._extract_action_lines(response).items():
+            if agents_to_ban is not None and agent_name not in agents_to_ban:
+                continue
+            if action != "WAIT":
+                forbidden_actions.setdefault(agent_name, set()).add(action)
+
+    def _format_forbidden_actions(self, forbidden_actions: Dict[str, set]) -> str:
+        if not any(forbidden_actions.values()):
+            return ""
+        lines = ["[Forbidden Actions This Replan Round]"]
+        for agent_name in self.robot_agent_names:
+            for action in sorted(forbidden_actions.get(agent_name, [])):
+                lines.append(f"- {agent_name}: {action}")
+        lines.append("Do not repeat forbidden actions; choose another listed legal action or WAIT.")
+        return "\n".join(lines) + "\n"
+
+    def _should_ban_individual_actions(self, feedback: str) -> bool:
+        return "Collision detected" not in feedback
+
+    def _make_feedback_more_actionable(self, feedback: str) -> str:
+        if "Collision detected" not in feedback:
+            return feedback
+        return (
+            feedback
+            + "\nCollision feedback means the concurrent robot combination is unsafe. "
+            + "Try fewer simultaneous actions, preferably one active robot and others WAIT."
+        )
+
+    def _try_parse_and_feedback(self, obs: EnvState, response: str):
+        parse_succ, parsed_str, plans = self.parser.parse(obs, response)
+        if not parse_succ:
+            return False, f"Parsing failed: {parsed_str}", []
+        for plan in plans:
+            ready, feedback = self.feedback_manager.give_feedback(plan)
+            if not ready:
+                return False, feedback, []
+        return True, "None", plans
+
+    def _sort_partial_fallback_responses(
+        self,
+        obs: EnvState,
+        legal_actions: Dict[str, List[str]],
+        forbidden_actions: Dict[str, set],
+    ) -> List[str]:
+        responses = []
+        seen = set()
+
+        def add_if_valid(actions: Dict[str, str]) -> None:
+            response = self._response_from_actions(actions)
+            if response in seen:
+                return
+            seen.add(response)
+            valid, _ = self._sort_validate_against_legal_actions(
+                obs,
+                response,
+                legal_actions,
+                forbidden_actions,
+            )
+            if valid:
+                responses.append(response)
+
+        fallback = self._sort_get_recommended_response(obs)
+        if fallback:
+            base_actions = self._extract_action_lines(fallback)
+            active_agents = [
+                agent for agent in self.robot_agent_names
+                if base_actions.get(agent, "WAIT") != "WAIT"
+            ]
+            from itertools import combinations
+            for size in range(len(active_agents), 0, -1):
+                for combo in combinations(active_agents, size):
+                    actions = {agent: "WAIT" for agent in self.robot_agent_names}
+                    for agent in combo:
+                        actions[agent] = base_actions[agent]
+                    add_if_valid(actions)
+
+        atomic_candidates = []
+        for agent_name in self.robot_agent_names:
+            for action in legal_actions.get(agent_name, []):
+                if action == "WAIT" or action in forbidden_actions.get(agent_name, set()):
+                    continue
+                atomic_candidates.append((agent_name, action))
+
+        def compatible(combo: Tuple[Tuple[str, str], ...]) -> bool:
+            agents = [agent for agent, _ in combo]
+            if len(set(agents)) != len(agents):
+                return False
+            picked = []
+            targets = []
+            for _, action in combo:
+                if "PICK" in action and "PLACE" in action:
+                    picked.append(action.split("PICK", 1)[1].split("PLACE", 1)[0].strip())
+                    targets.append(action.split("PLACE", 1)[1].strip())
+            return len(set(picked)) == len(picked) and len(set(targets)) == len(targets)
+
+        from itertools import combinations
+        max_parallel_actions = min(2, len(self.robot_agent_names))
+        if hasattr(self.env, "get_max_parallel_actions"):
+            try:
+                max_parallel_actions = min(max_parallel_actions, self.env.get_max_parallel_actions(obs))
+            except TypeError:
+                max_parallel_actions = min(max_parallel_actions, self.env.get_max_parallel_actions())
+        for size in range(max_parallel_actions, 0, -1):
+            for combo in combinations(atomic_candidates, size):
+                if not compatible(combo):
+                    continue
+                actions = {agent: "WAIT" for agent in self.robot_agent_names}
+                for agent, action in combo:
+                    actions[agent] = action
+                add_if_valid(actions)
+        return responses
         
     def compose_system_prompt(
         self,
         obs_desp: str,
-        plan_feedbacks: List[str] = [], 
+        plan_feedbacks: List[str] = [],
+        obs: Optional[EnvState] = None,
+        forbidden_actions: Optional[Dict[str, set]] = None,
         ):
         
         task_desp = self.env.describe_task_context() # should include task rules
@@ -461,7 +724,16 @@ EXECUTE
         if self.use_waypoints:
             action_desp += PATH_PLAN_INSTRUCTION
 
-        full_prompt = f"{task_desp}\n{action_desp}\n" 
+        full_prompt = f"{task_desp}\n{action_desp}\n"
+
+        if self._is_sort_task() and obs is not None and hasattr(self.env, "get_plan_state_prompt"):
+            full_prompt += self.env.get_plan_state_prompt(obs) + "\n"
+        if self._is_sort_task() and obs is not None:
+            legal_actions_prompt = self._sort_format_legal_actions_prompt(obs)
+            if legal_actions_prompt:
+                full_prompt += legal_actions_prompt + "\n"
+        if self._is_sort_task() and forbidden_actions is not None:
+            full_prompt += self._format_forbidden_actions(forbidden_actions)
         
         if self.use_history:
             history_desp = self.compose_round_history() 
@@ -482,7 +754,10 @@ EXECUTE
         full_prompt += self._format_blacklist_prompt()
         
         if self.comm_mode == "plan":
-            comm_prompt = get_plan_prompt(self.env)
+            if self._is_sort_task() and hasattr(self.env, "central_plan_prompt"):
+                comm_prompt = self.env.central_plan_prompt()
+            else:
+                comm_prompt = get_plan_prompt(self.env)
         elif self.comm_mode == "chat":
             comm_prompt = get_chat_prompt(self.env) 
         else:
@@ -528,7 +803,176 @@ Your response is:
 
         return "Follow the instructions above and output the next response now."
 
+    def _prompt_sort_one_round(self, obs: EnvState, save_path: str = ""):
+        """Sort-only prompt loop matching the public-code Sort deployment flow."""
+        plan_feedbacks = []
+        response_history = []
+        obs_desp = self.env.describe_obs(obs)
+        ready_to_execute = False
+        llm_plans = []
+        forbidden_actions = {}
+        legal_actions = self._sort_get_legal_actions(obs)
+        for i in range(self.num_replans):
+            system_prompt = self.compose_system_prompt(
+                obs_desp,
+                plan_feedbacks,
+                obs=obs,
+                forbidden_actions=forbidden_actions,
+            )
+            response, usage = self.query_once(
+                system_prompt, user_prompt=""
+            )
+            candidate_response = response
+            response_history.append(response)
+
+            timestamp = datetime.now().strftime("%m%d-%H%M")
+            tosave = [
+                    {
+                        "sender": "SystemPrompt",
+                        "message": system_prompt,
+                    },
+                    {
+                        "sender": "UserPrompt",
+                        "message": "",
+                    },
+                    {
+                        "sender": "Planner",
+                        "message": response,
+                    },
+                    usage,
+                ]
+            if save_path:
+                fname = f'{save_path}/replan{i}_{timestamp}.json'
+                json.dump(tosave, open(fname, 'w'))
+
+            curr_feedback = "None"
+            valid_legal, legal_reason = self._sort_validate_against_legal_actions(
+                obs,
+                response,
+                legal_actions,
+                forbidden_actions,
+            )
+            if not valid_legal:
+                curr_feedback = f"""
+Action candidate validation failed! {legal_reason}
+Previous response:
+{response}
+Choose exactly one action per robot from [Legal Actions]. Do not invent actions.
+                """
+                failed_agents = self._extract_agents_from_text(legal_reason)
+                if "Too many non-WAIT actions" not in legal_reason:
+                    self._ban_actions_from_response(
+                        response,
+                        forbidden_actions,
+                        agents=(failed_agents or None),
+                    )
+                ready_to_execute = False
+                parse_succ = False
+                llm_plans = []
+            else:
+                parse_succ, parsed_str, llm_plans = self.parser.parse(obs, response)
+                if not parse_succ:
+                    execute_str = 'EXECUTE' + response.split('EXECUTE')[-1]
+                    curr_feedback = f"""
+Parsing failed! {parsed_str}
+Previous response: {execute_str}
+Re-format to strictly follow [Action Output Instruction]!
+                    """
+                    failed_agents = self._extract_agents_from_text(parsed_str)
+                    self._ban_actions_from_response(
+                        response,
+                        forbidden_actions,
+                        agents=(failed_agents or None),
+                    )
+                    ready_to_execute = False
+                else:
+                    ready_to_execute = True
+                    for j, llm_plan in enumerate(llm_plans):
+                        ready_to_execute, env_feedback = self.feedback_manager.give_feedback(llm_plan)
+                        if not ready_to_execute:
+                            curr_feedback = self._make_feedback_more_actionable(env_feedback)
+                            if self._should_ban_individual_actions(env_feedback):
+                                failed_agents = self._extract_agents_from_text(env_feedback)
+                                self._ban_actions_from_response(
+                                    response,
+                                    forbidden_actions,
+                                    agents=(failed_agents or None),
+                                )
+                            break
+
+            plan_feedbacks.append(curr_feedback)
+            tosave = [
+                {
+                    "sender": "Feedback",
+                    "message": curr_feedback,
+                },
+                {
+                    "sender": "Action",
+                    "message": (response if not parse_succ else llm_plans[0].get_action_desp()),
+                },
+            ]
+            timestamp = datetime.now().strftime("%m%d-%H%M")
+            if save_path:
+                fname = f'{save_path}/replan{i}_feedback_{timestamp}.json'
+                json.dump(tosave, open(fname, 'w'))
+
+            if ready_to_execute:
+                break
+
+        if not ready_to_execute:
+            fallback_attempts = []
+            for fallback_response in self._sort_partial_fallback_responses(obs, legal_actions, forbidden_actions):
+                fallback_ready, fallback_feedback, fallback_plans = self._try_parse_and_feedback(
+                    obs,
+                    fallback_response,
+                )
+                fallback_attempts.append(
+                    {
+                        "response": fallback_response,
+                        "feedback": fallback_feedback,
+                        "ready": fallback_ready,
+                    }
+                )
+                if fallback_ready:
+                    ready_to_execute = True
+                    llm_plans = fallback_plans
+                    response_history.append(fallback_response)
+                    break
+            if fallback_attempts and save_path:
+                timestamp = datetime.now().strftime("%m%d-%H%M")
+                json.dump(
+                    [
+                        {
+                            "sender": "Planner",
+                            "message": fallback_attempts[-1]["response"],
+                        },
+                        {
+                            "sender": "Feedback",
+                            "message": (
+                                "Used deterministic partial fallback after LLM replans failed."
+                                if ready_to_execute
+                                else "Deterministic partial fallback attempted but no candidate passed feedback."
+                            ),
+                        },
+                        {
+                            "sender": "FallbackAttempts",
+                            "message": json.dumps(fallback_attempts, indent=2),
+                        },
+                    ],
+                    open(f"{save_path}/fallback_{timestamp}.json", "w"),
+                )
+
+        self.response_history = response_history
+        if ready_to_execute:
+            self.unresolved_plan_feedbacks = []
+        else:
+            self.unresolved_plan_feedbacks = plan_feedbacks[-3:]
+        return ready_to_execute, llm_plans, plan_feedbacks, response_history
+
     def prompt_one_round(self, obs: EnvState, save_path: str = ""): 
+        if self._is_sort_task():
+            return self._prompt_sort_one_round(obs, save_path=save_path)
+
         # Start with feedback from a previous runner step that failed to produce
         # any executable plan.  Without this, the next step sees an unchanged
         # scene and repeats the same invalid proposal.
@@ -580,8 +1024,9 @@ Your response is:
                     },
                     usage,
                 ]
-            fname = f'{save_path}/replan{i}_{timestamp}.json'
-            json.dump(tosave, open(fname, 'w'))  
+            if save_path:
+                fname = f'{save_path}/replan{i}_{timestamp}.json'
+                json.dump(tosave, open(fname, 'w'))  
             
             curr_feedback = "None"
             failed_llm_plan = None
@@ -619,8 +1064,9 @@ Re-format to strictly follow [Action Output Instruction]!
                 },
             ]
             timestamp = datetime.now().strftime("%m%d-%H%M")
-            fname = f'{save_path}/replan{i}_feedback_{timestamp}.json'
-            json.dump(tosave, open(fname, 'w')) 
+            if save_path:
+                fname = f'{save_path}/replan{i}_feedback_{timestamp}.json'
+                json.dump(tosave, open(fname, 'w')) 
 
             if ready_to_execute:
                 plan_str = parsed_str
@@ -652,19 +1098,31 @@ Re-format to strictly follow [Action Output Instruction]!
         for n in range(self.max_api_queries):
             print('querying {}th time'.format(n))
             try:
-                response, usage = _query_openai_compatible_chat(
-                    model=self.llm_source,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
+                if self._is_sort_task():
+                    response, usage = query_ollama_chat(
+                        model=self.llm_source,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                    )
+                else:
+                    response, usage = _query_openai_compatible_chat(
+                        model=self.llm_source,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                    )
 
                 print('======= response ======= \n ', response)
                 print('======= usage ======= \n ', usage)
                 break
             except Exception as e:
                 print(f"API error, try again: {e}")
+                if self._is_sort_task():
+                    response = ""
+                    usage = {"error": str(e), "model": self.llm_source}
             continue
         return response, usage
 

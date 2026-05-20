@@ -60,6 +60,7 @@ class LLMRunner:
         temperature: float = 0.0,
         llm_source: str = "gpt4",
         run_timeout: float = 600,  # Default 10 minutes timeout
+        light_output: bool = False,
         ):
         self.env = env
         self.env.reset()
@@ -100,7 +101,10 @@ class LLMRunner:
         )
         self.policy_kwargs = policy_kwargs
         self.video_format = video_format
-        self.skip_display = skip_display
+        self.light_output = light_output
+        # light_output is intended for quota-limited filesystems: avoid images,
+        # videos, prompt JSONs, and large/intermediate pickle files.
+        self.skip_display = skip_display or light_output
         self.split_parsed_plans = split_parsed_plans
         self.temperature = temperature
         self.parser = LLMResponseParser(
@@ -202,13 +206,17 @@ class LLMRunner:
 
             step_dir = os.path.join(save_dir, f"step_{step}")
             os.makedirs(step_dir, exist_ok=self.overwrite)
-            prompt_path = os.path.join(step_dir, "prompts")
-            os.makedirs(prompt_path, exist_ok=self.overwrite)
+            if self.light_output:
+                prompt_path = ""
+            else:
+                prompt_path = os.path.join(step_dir, "prompts")
+                os.makedirs(prompt_path, exist_ok=self.overwrite)
 
             sim_data = env.save_intermediate_state()
-            data_fname = f"{step_dir}/env_init.pkl"
-            with open(data_fname, "wb") as f:
-                pickle.dump(sim_data, f)
+            if not self.light_output:
+                data_fname = f"{step_dir}/env_init.pkl"
+                with open(data_fname, "wb") as f:
+                    pickle.dump(sim_data, f)
 
 
             if step == start_step and len(prev_llm_plans) > 0:
@@ -238,10 +246,11 @@ class LLMRunner:
                         self.display_plan(plan, save_name=f"vis_llm_plan_{i}", save_dir=step_dir)
 
 
-                for i, plan in enumerate(current_llm_plan):
-                    save_fname = os.path.join(step_dir, f"llm_plan_{i}.pkl")
-                    with open(save_fname, "wb") as f:
-                        pickle.dump(plan, f)
+                if not self.light_output:
+                    for i, plan in enumerate(current_llm_plan):
+                        save_fname = os.path.join(step_dir, f"llm_plan_{i}.pkl")
+                        with open(save_fname, "wb") as f:
+                            pickle.dump(plan, f)
 
 
             logging.info(f"Step: {step} LLM plan parsed, begin RRT planning ")
@@ -274,14 +283,15 @@ class LLMRunner:
                     if plan_success:
                         logging.info(f"Execute the plan for {len(policy.action_buffer)} steps")
 
-                        plan_fname = os.path.join(step_dir, f"rrt_plan_{i}.pkl")
-                        plans = policy.rrt_plan_results
-                        with open(plan_fname, "wb") as f:
-                            pickle.dump(plans, f)
+                        if not self.light_output:
+                            plan_fname = os.path.join(step_dir, f"rrt_plan_{i}.pkl")
+                            plans = policy.rrt_plan_results
+                            with open(plan_fname, "wb") as f:
+                                pickle.dump(plans, f)
 
-                        actions_fname = f"{step_dir}/actions_{i}.pkl"
-                        with open(actions_fname, "wb") as f:
-                            pickle.dump(policy.action_buffer, f)
+                            actions_fname = f"{step_dir}/actions_{i}.pkl"
+                            with open(actions_fname, "wb") as f:
+                                pickle.dump(policy.action_buffer, f)
 
                         while not policy.plan_exhausted:
                             sim_action = policy.act(obs, env.physics)
@@ -289,9 +299,12 @@ class LLMRunner:
                             num_sim_steps += 1
 
                 if num_sim_steps > 0:
-                    vid_name = f"{step_dir}/execute.mp4"
-                    env.export_render_to_video(vid_name, out_type=self.video_format,  fps=50)
-                    print(f'Plans all executed! Video sample saved to {vid_name}')
+                    if self.light_output:
+                        print("Plans all executed! Video export skipped because --light_output is enabled.")
+                    else:
+                        vid_name = f"{step_dir}/execute.mp4"
+                        env.export_render_to_video(vid_name, out_type=self.video_format,  fps=50)
+                        print(f'Plans all executed! Video sample saved to {vid_name}')
 
                 else:
                     print(f"Plan {i} failed to execute.")
@@ -305,9 +318,10 @@ class LLMRunner:
             else:
                 sim_data = env.save_intermediate_state()
 
-            data_fname = f"{step_dir}/env_end.pkl"
-            with open(data_fname, "wb") as f:
-                pickle.dump(sim_data, f)
+            if not self.light_output:
+                data_fname = f"{step_dir}/env_end.pkl"
+                with open(data_fname, "wb") as f:
+                    pickle.dump(sim_data, f)
 
             self.prompter.post_execute_update(
                 obs_desp="", # TODO
@@ -335,13 +349,30 @@ class LLMRunner:
         else:
             print("Run finished after {} timesteps in {:.2f}s".format(step, elapsed_time))
         self.prompter.post_episode_update()
-        save_episode_html(
-            save_dir,
-            html_fname=f"steps{step}_success_{success}",
-            video_fname="execute.mp4",
-            sender_keys=["Alice", "Bob", "Chad", "Dave", "Planner", "VerifiedPlanner", "CandidatePlanner", "Verifier", "Feedback", "Action"],
-            )
-        print(f"Episode html saved to {save_dir}")
+        if self.light_output:
+            html_path = os.path.join(save_dir, f"steps{step}_success_{success}.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    f"<title>Run {run_id} summary</title></head><body>"
+                    f"<h1>Run {run_id} summary</h1>"
+                    f"<p>success: {success}</p>"
+                    f"<p>step: {step}</p>"
+                    f"<p>timed_out: {timed_out}</p>"
+                    f"<p>elapsed_time: {elapsed_time:.2f}s</p>"
+                    "<p>Detailed prompts, pickles, images, and videos were skipped "
+                    "because <code>--light_output</code> is enabled.</p>"
+                    "</body></html>"
+                )
+            print(f"Light episode html saved to {html_path}")
+        else:
+            save_episode_html(
+                save_dir,
+                html_fname=f"steps{step}_success_{success}",
+                video_fname="execute.mp4",
+                sender_keys=["Alice", "Bob", "Chad", "Dave", "Planner", "VerifiedPlanner", "CandidatePlanner", "Verifier", "Feedback", "Action"],
+                )
+            print(f"Episode html saved to {save_dir}")
 
 
     def run(self, args):
@@ -448,6 +479,8 @@ class LLMRunner:
 def main(args):
     assert args.task in TASK_NAME_MAP.keys(), f"Task {args.task} not supported"
     env_cl = TASK_NAME_MAP[args.task]
+    if args.task == 'sort':
+        args.comm_mode = 'plan'
     if args.task == 'rope':
         args.output_mode = 'action_and_path'
         args.split_parsed_plans = True
@@ -527,6 +560,7 @@ def main(args):
         temperature=args.temperature,
         llm_source=args.llm_source,
         run_timeout=args.run_timeout,
+        light_output=args.light_output,
     )
     runner.run(args)
 
@@ -558,6 +592,7 @@ if __name__ == "__main__":
     parser.add_argument("--llm_source", "-llm", type=str, default="llama3.3:70b") # You can choose one model here.
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
+    parser.add_argument("--light_output", action="store_true", help="Save only final per-run result JSON and a small summary HTML; skip prompt logs, pickles, images, and videos.")
     logging.basicConfig(level=logging.INFO)
 
     args = parser.parse_args()

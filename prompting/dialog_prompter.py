@@ -267,8 +267,9 @@ EXECUTE
             },
             usage,
         ]
-        fname = f'{save_path}/replan{replan_idx}_output_verifier_{timestamp}.json'
-        json.dump(tosave, open(fname, 'w'))
+        if save_path:
+            fname = f'{save_path}/replan{replan_idx}_output_verifier_{timestamp}.json'
+            json.dump(tosave, open(fname, 'w'))
 
         # Keep a malformed verifier from destroying an otherwise parseable plan;
         # parser + environment feedback still provide the hard validation layer.
@@ -324,8 +325,9 @@ This previous response from [{final_agent}] failed to parse!: '{final_response}'
                 },
             ]
             timestamp = datetime.now().strftime("%m%d-%H%M")
-            fname = f'{save_path}/replan{i}_feedback_{timestamp}.json'
-            json.dump(tosave, open(fname, 'w')) 
+            if save_path:
+                fname = f'{save_path}/replan{i}_feedback_{timestamp}.json'
+                json.dump(tosave, open(fname, 'w')) 
 
             if ready_to_execute: 
                 break  
@@ -390,8 +392,9 @@ Your response is:
                     usage,
                 ]
                 timestamp = datetime.now().strftime("%m%d-%H%M")
-                fname = f'{save_path}/replan{replan_idx}_call{n_calls}_agent{agent_name}_{timestamp}.json'
-                json.dump(tosave, open(fname, 'w'))  
+                if save_path:
+                    fname = f'{save_path}/replan{replan_idx}_call{n_calls}_agent{agent_name}_{timestamp}.json'
+                    json.dump(tosave, open(fname, 'w'))  
 
                 num_responses[agent_name] += 1
                 # strip all the repeated \n and blank spaces in response: 
