@@ -31,6 +31,56 @@ TASK_NAME_MAP = {
     "pack": PackGroceryTask,
 }
 
+# Evaluation-compatible defaults live here instead of evaluator.py because the
+# project evaluator must stay unchanged.  When --comm_mode/--llm_source are not
+# provided explicitly, run_dialog.py applies the same task-specific defaults
+# that were previously carried by the modified evaluator.py.
+DEFAULT_COMM_MODES = {
+    "sort": "plan",
+    "cabinet": "plan",
+    "rope": "plan",
+    "sweep": "dialog",
+    "sandwich": "plan",
+    "pack": "plan",
+}
+
+DEFAULT_LLM_SOURCES = {
+    "sort": "qwen3.5:27b",
+    "cabinet": "llama3.3:70b",
+    "rope": "llama3.3:70b",
+    "sweep": "llama3.3:70b",
+    "sandwich": "llama3.3:70b",
+    "pack": "llama3.3:70b",
+}
+
+
+def apply_task_defaults(args):
+    """Fill run_dialog defaults that used to be injected by evaluator.py."""
+    env_comm_mode = os.environ.get("ROCO_COMM_MODE")
+    if args.comm_mode is None:
+        if env_comm_mode:
+            if env_comm_mode not in {"chat", "plan", "dialog"}:
+                raise ValueError(
+                    "ROCO_COMM_MODE must be one of: chat, plan, dialog "
+                    f"(got {env_comm_mode!r})"
+                )
+            args.comm_mode = env_comm_mode
+        else:
+            args.comm_mode = DEFAULT_COMM_MODES.get(args.task, "chat")
+
+    env_llm_source = os.environ.get("ROCO_LLM_SOURCE")
+    if args.llm_source is None:
+        args.llm_source = env_llm_source or DEFAULT_LLM_SOURCES.get(args.task, "llama3.3:70b")
+    return args
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class LLMRunner:
     def __init__(
         self,
@@ -478,9 +528,8 @@ class LLMRunner:
 
 def main(args):
     assert args.task in TASK_NAME_MAP.keys(), f"Task {args.task} not supported"
+    args = apply_task_defaults(args)
     env_cl = TASK_NAME_MAP[args.task]
-    if args.task == 'sort':
-        args.comm_mode = 'plan'
     if args.task == 'rope':
         args.output_mode = 'action_and_path'
         args.split_parsed_plans = True
@@ -574,7 +623,8 @@ if __name__ == "__main__":
     parser.add_argument("--tsteps", "-t", type=int, default=10)
     parser.add_argument("--task", type=str, default="cabinet")
     parser.add_argument("--output_mode", type=str, default="action_only", choices=["action_only", "action_and_path"])
-    parser.add_argument("--comm_mode", type=str, default="chat", choices=["chat", "plan", "dialog"])
+    parser.add_argument("--comm_mode", type=str, default=None, choices=["chat", "plan", "dialog"],
+                        help="Communication mode. If omitted, use task-specific evaluation defaults.")
     parser.add_argument("--control_freq", "-cf", type=int, default=15)
     parser.add_argument("--skip_display", "-sd", action="store_true")
     parser.add_argument("--direct_waypoints", "-dw", type=int, default=5)
@@ -589,10 +639,12 @@ if __name__ == "__main__":
     parser.add_argument("--split_parsed_plans", "-sp", action="store_true")
     parser.add_argument("--no_history", "-nh", action="store_true")
     parser.add_argument("--no_feedback", "-nf", action="store_true")
-    parser.add_argument("--llm_source", "-llm", type=str, default="llama3.3:70b") # You can choose one model here.
+    parser.add_argument("--llm_source", "-llm", type=str, default=None,
+                        help="Model source. If omitted, use task-specific evaluation defaults.")
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
-    parser.add_argument("--light_output", action="store_true", help="Save only final per-run result JSON and a small summary HTML; skip prompt logs, pickles, images, and videos.")
+    parser.add_argument("--light_output", action="store_true", default=env_flag("ROCO_LIGHT_OUTPUT"),
+                        help="Save only final per-run result JSON and a small summary HTML; skip prompt logs, pickles, images, and videos. Can also be enabled with ROCO_LIGHT_OUTPUT=1.")
     logging.basicConfig(level=logging.INFO)
 
     args = parser.parse_args()

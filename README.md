@@ -6,11 +6,6 @@
 
 
 #### 评测方式
-1. 跑分用
 ``` bash
-xvfb-run   python evaluator.py --llm_source qwen3.5:27b
-```
-2. 最后验收使用
-``` bash
-xvfb-run   python evaluator.py --llm_source llama3.3:70b
+xvfb-run   python evaluator.py 
 ```
